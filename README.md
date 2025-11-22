@@ -22,11 +22,13 @@ You should see something like the following output:
     v6.6
 ```
 
-Now prepare all the headers
+Now prepare all the headers (the last command will take some time to complete)
 ```sh
     make mrproper
     make olddefconfig
     make prepare
+    make modules_prepare
+    make -j4 modules
 ```
 
 
