@@ -21,7 +21,7 @@
 #include <linux/net.h>
 #include <net/sock.h>
 
-MODULE_AUTHOR("Lorenzo Susini");
+MODULE_AUTHOR("Simone Conti");
 MODULE_LICENSE("GPL");
 
 /************************************************
@@ -265,15 +265,15 @@ static void agent_hypercall(void)
                         (void *)irqaction_pci, 
                         sizeof(struct irqaction), 1);
     generic_hypercall(SAVE_MEMORY_HYPERCALL, 
-                        (void *)THIS_MODULE->module_core, 
-                        THIS_MODULE->core_size, 1);
+                        (void *)THIS_MODULE->core_layout.base, 
+                        THIS_MODULE->core_layout.size, 1);
     generic_hypercall(PROTECT_MEMORY_HYPERCALL, 
                         (void *)descriptor->address,
                         (int)descriptor->size, 1);
 
     walk_page_tables_hypercall((unsigned long) i2d_pointer(pci_irq));
     walk_page_tables_hypercall((unsigned long)irqaction_pci);
-    walk_page_tables_hypercall((unsigned long)THIS_MODULE->module_core);
+    walk_page_tables_hypercall((unsigned long)THIS_MODULE->core_layout.base);
     walk_page_tables_hypercall((unsigned long)descriptor->address);
     kfree(descriptor);
     
@@ -491,19 +491,18 @@ static void pin_control_registers(void)
     val = native_read_msr(MSR_KVM_CR0_PIN_ALLOWED);
     lo = val & mask;
     hi = (val >> 32);
-    native_write_msr(MSR_KVM_CR0_PINNED, ((u64)hi << 32) | lo);
+    native_write_msr(MSR_KVM_CR0_PINNED, lo, hi);
 
     val = native_read_msr(MSR_KVM_CR4_PIN_ALLOWED);
     lo = val & mask;
     hi = (val >> 32);
-    native_write_msr(MSR_KVM_CR4_PINNED, ((u64)hi << 32) | lo);
-
+    native_write_msr(MSR_KVM_CR4_PINNED, lo, hi);
 }
 
 static void pin_idt_register(void)
 {
     u32 lo = 1;
-    native_write_msr(MSR_KVM_IDTR_PINNED, (u64)lo);
+    native_write_msr(MSR_KVM_IDTR_PINNED, lo, 0);
 }
 
 
