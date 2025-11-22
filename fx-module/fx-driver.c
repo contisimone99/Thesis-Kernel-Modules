@@ -264,16 +264,16 @@ static void agent_hypercall(void)
     generic_hypercall(SAVE_MEMORY_HYPERCALL, 
                         (void *)irqaction_pci, 
                         sizeof(struct irqaction), 1);
-    generic_hypercall(SAVE_MEMORY_HYPERCALL, 
-                        (void *)THIS_MODULE->core_layout.base, 
-                        THIS_MODULE->core_layout.size, 1);
+    generic_hypercall(SAVE_MEMORY_HYPERCALL,
+                      (void *)THIS_MODULE->mem[MOD_TEXT].base,
+                      THIS_MODULE->mem[MOD_TEXT].size, 1);
     generic_hypercall(PROTECT_MEMORY_HYPERCALL, 
                         (void *)descriptor->address,
                         (int)descriptor->size, 1);
 
     walk_page_tables_hypercall((unsigned long) i2d_pointer(pci_irq));
     walk_page_tables_hypercall((unsigned long)irqaction_pci);
-    walk_page_tables_hypercall((unsigned long)THIS_MODULE->core_layout.base);
+    walk_page_tables_hypercall((unsigned long)THIS_MODULE->mem[MOD_TEXT].base);
     walk_page_tables_hypercall((unsigned long)descriptor->address);
     kfree(descriptor);
     
