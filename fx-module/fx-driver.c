@@ -21,7 +21,7 @@
 #include <linux/net.h>
 #include <net/sock.h>
 
-MODULE_AUTHOR("Lorenzo Susini");
+MODULE_AUTHOR("Simone Conti");
 MODULE_LICENSE("GPL");
 
 /************************************************
