@@ -491,19 +491,18 @@ static void pin_control_registers(void)
     val = native_read_msr(MSR_KVM_CR0_PIN_ALLOWED);
     lo = val & mask;
     hi = (val >> 32);
-    native_write_msr(MSR_KVM_CR0_PINNED, lo, hi);
+    native_write_msr(MSR_KVM_CR0_PINNED, ((u64)hi << 32) | lo);
 
     val = native_read_msr(MSR_KVM_CR4_PIN_ALLOWED);
     lo = val & mask;
     hi = (val >> 32);
-    native_write_msr(MSR_KVM_CR4_PINNED, lo, hi);
+    native_write_msr(MSR_KVM_CR4_PINNED, ((u64)hi << 32) | lo);
 }
 
 static void pin_idt_register(void)
 {
     u32 lo = 1;
-    native_write_msr(MSR_KVM_IDTR_PINNED, lo, 0);
-}
+    native_write_msr(MSR_KVM_IDTR_PINNED, (u64)lo);}
 
 
 static int fx_module_init(void)
