@@ -1,0 +1,10 @@
+rootfs.ext2
+*.ext2
+debian-rootfs/
+*.img
+.mod.c
+.mod
+.order
+.cmd
+.ko
+
