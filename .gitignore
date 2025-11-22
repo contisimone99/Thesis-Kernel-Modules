@@ -8,3 +8,4 @@ rootfs.ext2
 debian-rootfs/example.img
 *.o
 *.o.d
+linux
