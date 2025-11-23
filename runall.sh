@@ -1,9 +1,22 @@
-#!/bin/sh 
+#!/bin/sh
 set -e
 
-sudo mount ./debian-rootfs/example.img -t ext4 /mnt/example
-sudo find ./fx-module -name '*.ko' -exec cp "{}" /mnt/example/root  \;
-sudo umount -t ext4 /mnt/example
+MNT=/mnt/example
+IMG=./debian-rootfs/example.img
+
+# Crea il mount point se non esiste
+sudo mkdir -p "$MNT"
+
+# Monta l'immagine (opzionale ma consigliato: -o loop)
+sudo mount -o loop -t ext4 "$IMG" "$MNT"
+
+# Copia i .ko dentro /root dell'FS
+sudo find ./fx-module -name '*.ko' -exec cp "{}" "$MNT/root" \;
+
+# Smonta
+sudo umount "$MNT"
+
+# Avvia QEMU
 sudo ~/qemu/build/qemu-system-x86_64 \
     -nographic \
     -device edu \
@@ -13,11 +26,11 @@ sudo ~/qemu/build/qemu-system-x86_64 \
     -boot c \
     -m 512M \
     -cpu host \
-    -hda ./debian-rootfs/example.img \
+    -drive file=./debian-rootfs/example.img,format=raw,media=disk,if=ide \
     -k it \
     -s \
-    -nographic \
-    -netdev user,id=network0,hostfwd=tcp::10022-:22 -device e1000,netdev=network0,mac=52:54:00:12:34:56 \
-    -append "console=ttyS0 root=/dev/sda rw acpi=off nokaslr" \
+    -netdev user,id=network0,hostfwd=tcp::10022-:22 \
+    -device e1000,netdev=network0,mac=52:54:00:12:34:56 \
+    -append "console=ttyS0 root=/dev/sda rw acpi=off nokaslr"
     #-overcommit mem-lock=on \
     #2>stderror_file \
