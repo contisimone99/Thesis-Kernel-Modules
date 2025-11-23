@@ -22,13 +22,15 @@ You should see something like the following output:
     v6.6
 ```
 
-Now prepare all the headers (the last command will take some time to complete)
+Now prepare all the headers (the last 2 command will take some time to complete)
 ```sh
     make mrproper
     make olddefconfig
     make prepare
+    make x86_64_defconfig
     make modules_prepare
-    make -j4 modules
+    make -j"$(nproc)" modules
+    make -j"$(nproc)" bzImage
 ```
 
 
