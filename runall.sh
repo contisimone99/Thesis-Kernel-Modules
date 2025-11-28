@@ -7,13 +7,12 @@ IMG=./debian-rootfs/example.img
 # Crea il mount point se non esiste
 sudo mkdir -p "$MNT"
 
-# Monta l'immagine (opzionale ma consigliato: -o loop)
+# Monta l'immagine
 sudo mount -o loop -t ext4 "$IMG" "$MNT"
 
 # Copia i .ko dentro /root dell'FS
 sudo find ./fx-module -name '*.ko' -exec cp "{}" "$MNT/root" \;
 
-# Smonta
 sudo umount "$MNT"
 
 # Avvia QEMU
