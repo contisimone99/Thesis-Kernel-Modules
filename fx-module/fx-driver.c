@@ -302,7 +302,7 @@ static void agent_hypercall(void)
     FX_DBG("agent_hypercall: IDT base=0x%lx size=%u\n",
            descriptor->address, (unsigned int)descriptor->size);
 
-    //generic_hypercall(SET_IRQ_LINE_HYPERCALL, (void *)((unsigned long)pci_irq), 0, 0);
+    generic_hypercall(SET_IRQ_LINE_HYPERCALL, (void *)((unsigned long)pci_irq), 0, 0);
     FX_DBG("agent_hypercall: SET_IRQ_LINE_HYPERCALL done (irq=%d)\n", pci_irq);
     FX_DBG("descriptor pre start monitor: %px", descriptor);
     generic_hypercall(START_MONITOR_HYPERCALL,
