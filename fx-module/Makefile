@@ -1,4 +1,4 @@
-CFLAGS  := -O0
+EXTRA_CFLAGS  := -g
 
 obj-m:=fx-driver.o
 all:

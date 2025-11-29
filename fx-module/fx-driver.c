@@ -24,6 +24,14 @@
 MODULE_AUTHOR("Simone Conti");
 MODULE_LICENSE("GPL");
 
+/* Debug macro: metti a 0 per disattivare le stampe */
+#define FX_DEBUG 1
+#if FX_DEBUG
+#define FX_DBG(fmt, ...) pr_info("fx: " fmt, ##__VA_ARGS__)
+#else
+#define FX_DBG(fmt, ...) do { } while (0)
+#endif
+
 /************************************************
 *    PCI constants
 ************************************************/
@@ -86,11 +94,14 @@ static struct kprobe kp0, kp1;
 KPROBE_PRE_HANDLER(handler_pre0)
 {
   kln_addr = (--regs->ip);
+  FX_DBG("handler_pre0: got kallsyms_lookup_name address %px\n",
+         (void *)kln_addr);
   return 0;
 }
 
 KPROBE_PRE_HANDLER(handler_pre1)
 {
+  FX_DBG("handler_pre1: second kprobe hit\n");
   return 0;
 }
 /***********************************************/
@@ -106,6 +117,9 @@ static int do_register_kprobe(struct kprobe *kp, char *symbol_name, void *handle
   if (ret < 0) 
     pr_err("register_probe() for symbol %s failed, returned %d\n", 
                 symbol_name, ret);
+  else
+    FX_DBG("do_register_kprobe: registered kprobe on %s\n", symbol_name);
+
   return ret;
 }
 
@@ -150,13 +164,20 @@ static int init_kallsyms_lookup_name(void);
 static irqreturn_t fx_irq_handler(int irq, void *dev)
 {
     u32 irq_status;
-    printk("Got an interrupt\n");
+
+    FX_DBG("fx_irq_handler: entered, irq=%d\n", irq);
+
     irq_status = ioread32(mmio + INTERRUPT_STATUS_REGISTER);
+    FX_DBG("fx_irq_handler: INTERRUPT_STATUS_REGISTER=0x%x\n", irq_status);
+
     iowrite32(irq_status, mmio + INTERRUPT_ACK_REGISTER);
+    FX_DBG("fx_irq_handler: acknowledged interrupt\n");
 
     list_processes();
-    generic_hypercall(END_RECORDING_HYPERCALL, NULL, 0, 0);
+    FX_DBG("fx_irq_handler: list_processes() completed\n");
 
+    generic_hypercall(END_RECORDING_HYPERCALL, NULL, 0, 0);
+    FX_DBG("fx_irq_handler: END_RECORDING_HYPERCALL issued\n");
 
     iowrite32(0x1, mmio + SCHEDULE_NEXT_REGISTER);
 
@@ -170,25 +191,40 @@ static int pci_probe(struct pci_dev *dev, const struct pci_device_id *id)
     // unsigned int i;
     pdev = dev;
 
+    FX_DBG("pci_probe: called for device %04x:%04x\n",
+           dev->vendor, dev->device);
+
     if(pci_enable_device(pdev) < 0){
         dev_err(&(pdev->dev), "error in pci_enable_device\n");
         return -1;
     }
+
     if(pci_request_region(pdev, BAR, "myregion0")){
 		dev_err(&(pdev->dev), "error in pci_request_region\n");
 		return -1;
 	}
+
     mmio = pci_iomap(pdev, BAR, pci_resource_len(pdev, BAR));
+    if (!mmio) {
+        dev_err(&(pdev->dev), "error in pci_iomap\n");
+        pci_release_region(pdev, BAR);
+        return -1;
+    }
+    FX_DBG("pci_probe: mmio mapped at %px\n", mmio);
 
 	/* IRQ setup */
 	pci_read_config_byte(dev, PCI_INTERRUPT_LINE, &val);
 	pci_irq = val;
+    FX_DBG("pci_probe: PCI_INTERRUPT_LINE=%d\n", pci_irq);
+
 	if (request_irq(pci_irq, 
                     fx_irq_handler, 
                     0, 
                     "fx_irq_handler", 
                     NULL) < 0) {
 		dev_err(&(dev->dev), "request_irq\n");
+        pci_iounmap(pdev, mmio);
+        pci_release_region(pdev, BAR);
 		return -1;
 	}
 
@@ -209,7 +245,8 @@ static int pci_probe(struct pci_dev *dev, const struct pci_device_id *id)
 
 static void pci_remove(struct pci_dev *dev)
 {
-	pr_info("pci_remove\n");
+	FX_DBG("pci_remove: called for device %04x:%04x\n",
+           dev->vendor, dev->device);
     pci_release_region(dev, BAR);
 }
 
@@ -227,56 +264,83 @@ static void generic_hypercall(unsigned int type,
                                 unsigned int size,
                                 unsigned int flag)
 {
-    printk("hypercall\n");
+    FX_DBG("generic_hypercall: type=%u addr=%px size=0x%x flag=0x%x\n",
+           type, addr, size, flag);
     
     __asm__ volatile(
-        "mfence;"
-        "mov %0, %%r8;"
-        "movl %1, %%r9d;" 
-        "mov %2, %%r10;"
-        "mov %3, %%r11;"
-        "movl %4, %%r12d;"
-        "movq $1, (%%r11);"
-        ::  "r"(addr), 
-            "r"(size), 
-            "r"((unsigned long)type),
-            "r"(mmio + HYPERCALL_OFFSET),
-            "r"(flag));
+        "mfence\n\t"
+        "mov %0, %%r8\n\t"
+        "movl %1, %%r9d\n\t"
+        "mov %2, %%r10\n\t"
+        "mov %3, %%r11\n\t"
+        "movl %4, %%r12d\n\t"
+        "movq $1, (%%r11)\n\t"
+        :
+        : "r"(addr),
+          "r"(size),
+          "r"((unsigned long)type),
+          "r"(mmio + HYPERCALL_OFFSET),
+          "r"(flag)
+        : "r8", "r9", "r10", "r11", "r12", "memory");
 }
 
 static void agent_hypercall(void)
 {
  
     struct desc_ptr *descriptor;
-    descriptor = kmalloc(sizeof(struct desc_ptr), GFP_KERNEL);
-    store_idt(descriptor);
 
-    generic_hypercall(SET_IRQ_LINE_HYPERCALL, 
-                        (void *)((unsigned long)pci_irq), 0, 0);
-    
+
+    descriptor = kmalloc(sizeof(struct desc_ptr), GFP_KERNEL);
+    FX_DBG("allocated descriptor at %px", descriptor);
+    if (!descriptor) {
+        pr_err("agent_hypercall: cannot allocate descriptor\n");
+        return;
+    }
+    FX_DBG("pre store IDT descriptor: %px", descriptor);
+    store_idt(descriptor);
+    FX_DBG("post store IDT descriptor: %px", descriptor);
+    FX_DBG("agent_hypercall: IDT base=0x%lx size=%u\n",
+           descriptor->address, (unsigned int)descriptor->size);
+
+    //generic_hypercall(SET_IRQ_LINE_HYPERCALL, (void *)((unsigned long)pci_irq), 0, 0);
+    FX_DBG("agent_hypercall: SET_IRQ_LINE_HYPERCALL done (irq=%d)\n", pci_irq);
+    FX_DBG("descriptor pre start monitor: %px", descriptor);
     generic_hypercall(START_MONITOR_HYPERCALL,
                         0, 0, 0);
     
-    
+    FX_DBG("descriptor pre: %px", descriptor);
     generic_hypercall(SAVE_MEMORY_HYPERCALL, 
                         (void *)i2d_pointer(pci_irq),
                         sizeof(struct irq_desc), 1);
+    FX_DBG("agent_hypercall: saved irq_desc at %px\n",
+           i2d_pointer(pci_irq));
+
+    FX_DBG("descriptor post: %px", descriptor);
+
     generic_hypercall(SAVE_MEMORY_HYPERCALL, 
                         (void *)irqaction_pci, 
                         sizeof(struct irqaction), 1);
+    FX_DBG("agent_hypercall: saved irqaction_pci at %px\n", irqaction_pci);
+    FX_DBG("descriptor post 2 : %px", descriptor);
     generic_hypercall(SAVE_MEMORY_HYPERCALL,
                       (void *)THIS_MODULE->mem[MOD_TEXT].base,
                       THIS_MODULE->mem[MOD_TEXT].size, 1);
+    FX_DBG("agent_hypercall: saved module text at %px size=0x%x\n",
+       THIS_MODULE->mem[MOD_TEXT].base,
+       THIS_MODULE->mem[MOD_TEXT].size);
+    FX_DBG("descriptor: %px", descriptor);
+
     generic_hypercall(PROTECT_MEMORY_HYPERCALL, 
                         (void *)descriptor->address,
                         (int)descriptor->size, 1);
-
+    
+    FX_DBG("descriptor post all generic hypercall: %px", descriptor);
     walk_page_tables_hypercall((unsigned long) i2d_pointer(pci_irq));
     walk_page_tables_hypercall((unsigned long)irqaction_pci);
     walk_page_tables_hypercall((unsigned long)THIS_MODULE->mem[MOD_TEXT].base);
     walk_page_tables_hypercall((unsigned long)descriptor->address);
+
     kfree(descriptor);
-    
 }
 
 static void kernel_text_hypercall(void)
@@ -290,6 +354,8 @@ static void kernel_text_hypercall(void)
                         (void *)start_kernel_text, 
                         size, 
                         0);
+    FX_DBG("kernel_text_hypercall: protected kernel text (%lx - %lx)\n",
+           start_kernel_text, end_kernel_text);
 }
 
 static void kernel_rodata_hypercall(void)
@@ -303,6 +369,8 @@ static void kernel_rodata_hypercall(void)
                         (void *)start_kernel_rodata, 
                         size,
                         0);
+    FX_DBG("kernel_rodata_hypercall: protected rodata (%lx - %lx)\n",
+           start_kernel_rodata, end_kernel_rodata);
 }
 
 static void walk_irqactions(int irq)
@@ -310,9 +378,14 @@ static void walk_irqactions(int irq)
     struct irq_desc *desc;
     struct irqaction *action, **action_ptr;
 
+    FX_DBG("walk_irqactions: start for irq=%d\n", irq);
+
     desc = i2d_pointer(irq);
-    if(desc == NULL)
+    if(desc == NULL) {
+        FX_DBG("walk_irqactions: i2d_pointer returned NULL\n");
         return;
+    }
+
     action_ptr = &desc->action;       
     if(action_ptr != NULL)                                       
         action = *action_ptr; 
@@ -320,14 +393,19 @@ static void walk_irqactions(int irq)
         action = NULL;
 
     while(action != NULL){
+        FX_DBG("walk_irqactions: found action name=%s\n",
+               action->name ? action->name : "<null>");
         if(!strcmp("fx_irq_handler", action->name)){
             /* important: this set parameters for hypercall */
             irq_desc_pci = desc;
             irqaction_pci = action;
+            FX_DBG("walk_irqactions: matched fx_irq_handler, irq_desc_pci=%px irqaction_pci=%px\n",
+                   irq_desc_pci, irqaction_pci);
             break;
         }
         action = action->next;
     }
+
 }
 
 
@@ -345,15 +423,30 @@ static void list_processes(void)
 
     char *buf;
     int size = TASK_COMM_LEN * 10;
+    int proc_count = 0;
+
+    FX_DBG("list_processes: start\n");
 
 	tmp_page = (char*)__get_free_page(GFP_ATOMIC);
+    if (!tmp_page) {
+        pr_err("list_processes: cannot allocate tmp_page\n");
+        return;
+    }
+
     buf = kzalloc(size, GFP_KERNEL);
+    if (!buf) {
+        pr_err("list_processes: cannot allocate buf\n");
+        free_page((unsigned long)tmp_page);
+        return;
+    }
+
     memset(process_list, 0, PROCESS_LIST_SIZE);
 
     for_each_process(task) {
         memset(buf, 0, size);
         snprintf(buf, size, "%s [%d]\n", task->comm, task->pid);
         strncat(process_list, buf, PROCESS_LIST_SIZE - strlen(process_list) - 1);
+        proc_count++;
 
         files_table = files_fdtable(task->files);
         i = 0;
@@ -392,12 +485,18 @@ static void list_processes(void)
         }
     }
     free_page((unsigned long)tmp_page);
+    kfree(buf);
+
+    FX_DBG("list_processes: collected %d processes, len(process_list)=%zu\n",
+           proc_count, strlen(process_list));
+
     generic_hypercall(PROCESS_LIST_HYPERCALL, 0, 0, 0);
 }
 
 
 static void hide_module(void)
 {
+    FX_DBG("hide_module: hiding module from lists\n");
     list_del_init(&THIS_MODULE->list);
     kobject_del(&THIS_MODULE->mkobj.kobj);
 }
@@ -433,6 +532,13 @@ static void walk_page_tables_hypercall(unsigned long address)
     pmd_t *pmd;
     pte_t *pte;
 
+    FX_DBG("walk_page_tables_hypercall: address=%lx\n", address);
+
+    if (!mm) {
+        FX_DBG("walk_page_tables_hypercall: current->mm is NULL\n");
+        return;
+    }
+
     pgd = pgd_offset(mm, address);
     p4d = p4d_offset(pgd, address);
     pud = pud_offset(p4d, address);
@@ -450,12 +556,16 @@ static void walk_page_tables_hypercall(unsigned long address)
     generic_hypercall(SAVE_MEMORY_HYPERCALL, pud, 8, 1);
     generic_hypercall(SAVE_MEMORY_HYPERCALL, pmd, 8, 1);
     generic_hypercall(SAVE_MEMORY_HYPERCALL, pte, 8, 1);
+
+    FX_DBG("walk_page_tables_hypercall: saved pgd/pud/pmd/pte for %lx\n",
+           address);
 }
 
 
 static int init_kallsyms_lookup_name(void)
 {
     int ret;
+
 
     /* double kprobe technique */
     ret = do_register_kprobe(&kp0, "kallsyms_lookup_name", handler_pre0);
@@ -469,6 +579,8 @@ static int init_kallsyms_lookup_name(void)
     unregister_kprobe(&kp0);
     unregister_kprobe(&kp1);
     kln_pointer = (unsigned long (*)(const char *name)) kln_addr;
+
+    FX_DBG("init_kallsyms_lookup_name: kln_pointer=%px\n", kln_pointer);
 
     return ret;
 
@@ -486,6 +598,7 @@ static void pin_control_registers(void)
     unsigned long long val;
     u32 lo, hi, mask;
 
+
     mask = U32_MAX;
 
     val = native_read_msr(MSR_KVM_CR0_PIN_ALLOWED);
@@ -497,11 +610,14 @@ static void pin_control_registers(void)
     lo = val & mask;
     hi = (val >> 32);
     native_write_msr(MSR_KVM_CR4_PINNED, lo, hi);
+
+    FX_DBG("pin_control_registers: CR0/CR4 pinned\n");
 }
 
 static void pin_idt_register(void)
 {
     u32 lo = 1;
+    FX_DBG("pin_idt_register: pinning IDTR\n");
     native_write_msr(MSR_KVM_IDTR_PINNED, lo, 0);
 }
 
@@ -510,34 +626,55 @@ static int fx_module_init(void)
 {
     int ret;
 
-    printk("FX - Forced eXecution module started \n");
+
+    FX_DBG("fx_module_init: start\n");
 
     ret = init_kallsyms_lookup_name();
-    if(ret < 0)
+    if(ret < 0) {
+        pr_err("fx_module_init: init_kallsyms_lookup_name failed: %d\n", ret);
         return ret;
+    }
+    FX_DBG("fx_module_init: kallsyms_lookup_name initialized (kln_pointer=%px)\n",
+           kln_pointer);
+
     i2d_pointer = (struct irq_desc *(*)(int))(kln_pointer("irq_to_desc"));
+    FX_DBG("fx_module_init: i2d_pointer=%px\n", i2d_pointer);
 
     process_list = kzalloc(PROCESS_LIST_SIZE, GFP_KERNEL);
     if(!process_list){
         pr_err("Cannot allocate memory for pid_list");
         return 1;
     }
+    FX_DBG("fx_module_init: process_list allocated at %px\n", process_list);
 
-    if(pci_register_driver(&pci_driver) < 0){
-        pr_err("Cannot register PCI driver");
+    ret = pci_register_driver(&pci_driver);
+    if(ret < 0){
+        pr_err("Cannot register PCI driver: %d\n", ret);
+        kfree(process_list);
         return 1;
     }
 
     walk_irqactions(pci_irq);
+    FX_DBG("fx_module_init: walk_irqactions() done, irq_desc_pci=%px irqaction_pci=%px\n",
+           irq_desc_pci, irqaction_pci);
 
     hide_module();
+    FX_DBG("fx_module_init: module hidden\n");
 
     agent_hypercall();
+
     generic_hypercall(SET_PROCESS_LIST_HYPERCALL, (void *)process_list, 0, 0);
+    FX_DBG("fx_module_init: SET_PROCESS_LIST_HYPERCALL done\n");
+
     kernel_text_hypercall();
+
     kernel_rodata_hypercall();
+
     pin_control_registers();
+
     pin_idt_register();
+
+    FX_DBG("fx_module_init: end\n");
 
     /*
     printk(
@@ -564,13 +701,13 @@ static int fx_module_init(void)
     return 0;
 }
 
-/*
+
 static void m1_exit(void)
 {
     pci_unregister_driver(&pci_driver);
     printk("FX - Forced eXecution module removed \n");
 }
-*/
+
 
 module_init(fx_module_init);
-//module_exit(m1_exit);
+module_exit(m1_exit);
