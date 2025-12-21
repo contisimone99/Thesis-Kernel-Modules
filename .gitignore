@@ -1,3 +1,4 @@
+fx-module/Module.symvers
 rootfs.ext2
 *.ext2
 *.mod.c
