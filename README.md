@@ -5,32 +5,39 @@
 
 Add the submodule to the repo and grab the 6.6LTS kernel version (it will take some time)
 ```sh
-    git submodule add https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux-stable.git linux
-    cd linux
-    git fetch --all --tags
-    git checkout v6.6
-
+    git submodule update --init --recursive
 ```
-Check that it is the correct version
+
+Inside the repo you should see the following branch:
 
 ```sh
-    git describe --tags
-```
-You should see something like the following output:
-
-```sh
-    v6.6
+    guest-6.6
 ```
 
 Now prepare all the headers (the last 2 command will take some time to complete)
 ```sh
-    make mrproper
-    make olddefconfig
-    make prepare
-    make x86_64_defconfig
-    make modules_prepare
-    make -j"$(nproc)" modules
-    make -j"$(nproc)" bzImage
+cd linux 
+
+# 1. complete cleanup
+make mrproper
+
+# 2. generate x86_64 config
+make x86_64_defconfig
+
+# 3. prepare necessary file for build
+make prepare
+
+# 4. prepare environment to compile modules
+make modules_prepare
+
+# 5. compile kernel image (bzImage)
+make -j"$(nproc)" bzImage
+
+# 6. compile kernel modules
+make -j"$(nproc)" modules
+
+
+
 ```
 
 
