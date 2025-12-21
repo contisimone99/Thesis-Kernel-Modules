@@ -35,9 +35,6 @@ Now prepare all the headers (the last 2 command will take some time to complete)
 
     # 6. compile kernel modules
     make -j"$(nproc)" modules
-
-
-
 ```
 
 
