@@ -16,25 +16,25 @@ Inside the repo you should see the following branch:
 
 Now prepare all the headers (the last 2 command will take some time to complete)
 ```sh
-cd linux 
+    cd linux 
 
-# 1. complete cleanup
-make mrproper
+    # 1. complete cleanup
+    make mrproper
 
-# 2. generate x86_64 config
-make x86_64_defconfig
+    # 2. generate x86_64 config
+    make x86_64_defconfig
 
-# 3. prepare necessary file for build
-make prepare
+    # 3. prepare necessary file for build
+    make prepare
 
-# 4. prepare environment to compile modules
-make modules_prepare
+    # 4. prepare environment to compile modules
+    make modules_prepare
 
-# 5. compile kernel image (bzImage)
-make -j"$(nproc)" bzImage
+    # 5. compile kernel image (bzImage)
+    make -j"$(nproc)" bzImage
 
-# 6. compile kernel modules
-make -j"$(nproc)" modules
+    # 6. compile kernel modules
+    make -j"$(nproc)" modules
 
 
 
