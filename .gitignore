@@ -1,4 +1,3 @@
-linux
 rootfs.ext2
 *.ext2
 *.mod.c
