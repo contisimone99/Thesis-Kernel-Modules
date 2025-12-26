@@ -587,11 +587,11 @@ static int init_kallsyms_lookup_name(void)
 }
 
 
-#define MSR_KVM_CR0_PIN_ALLOWED	0x4b564d08
-#define MSR_KVM_CR4_PIN_ALLOWED 0x4b564d09
-#define MSR_KVM_CR0_PINNED 		0x4b564d0a
-#define MSR_KVM_CR4_PINNED 		0x4b564d0b
-#define MSR_KVM_IDTR_PINNED		0x4b564d0c
+#define MSR_KVM_CR0_PIN_ALLOWED	0x4b564d09
+#define MSR_KVM_CR4_PIN_ALLOWED 0x4b564d0a
+#define MSR_KVM_CR0_PINNED 		0x4b564d0b
+#define MSR_KVM_CR4_PINNED 		0x4b564d0c
+#define MSR_KVM_IDTR_PINNED		0x4b564d0d
 
 static void pin_control_registers(void)
 {
