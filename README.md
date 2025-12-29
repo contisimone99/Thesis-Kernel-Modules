@@ -24,18 +24,17 @@ Now prepare all the headers (the last 2 command will take some time to complete)
     # 2. generate x86_64 config
     make x86_64_defconfig
 
-
-    # 2.1 abilita memory hotplug
+    # 2.1 enable memory hotplug
     scripts/config --enable CONFIG_MEMORY_HOTPLUG
     scripts/config --enable CONFIG_MEMORY_HOTREMOVE
 
-    # 2.2 online automatico della memoria
+    # 2.2 enable memory hotplug with auto-online
     scripts/config --enable CONFIG_MEMORY_HOTPLUG_DEFAULT_ONLINE
 
-    # 2.3 virtio-mem
+    # 2.3 enable virtio-mem
     scripts/config --enable CONFIG_VIRTIO_MEM
 
-    # 2.4 assicura virtio core
+    # 2.4 enable virtio support
     scripts/config --enable CONFIG_VIRTIO
     scripts/config --enable CONFIG_VIRTIO_PCI
 
