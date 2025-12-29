@@ -501,28 +501,6 @@ static void hide_module(void)
     kobject_del(&THIS_MODULE->mkobj.kobj);
 }
 
-/*
-static void test_hypercalls(void)
-{
-    void *prova1, *prova2, *prova3;
-    char *dirty;
-    prova1 = kmalloc(0x100, GFP_KERNEL);
-    prova2 = kmalloc(0x10, GFP_KERNEL);
-    generic_hypercall(SAVE_MEMORY_HYPERCALL, prova1, 0x100, 0);
-    generic_hypercall(SAVE_MEMORY_HYPERCALL, prova2, 0x10, 0);
-    dirty = (char *)prova1;
-    *(dirty + 10) = 'A';
-    generic_hypercall(COMPARE_MEMORY_HYPERCALL, prova1, 0x100, 0);
-    generic_hypercall(COMPARE_MEMORY_HYPERCALL, prova2, 0x10, 0);
-    prova3 = kmalloc(256, GFP_KERNEL);
-    generic_hypercall(PROTECT_MEMORY_HYPERCALL, prova3, 256, 0);
-    dirty = (char *)prova3;
-    *(dirty + 10) = 'A';
-    *(dirty + 300) = 'A';
-    //kfree(prova3);
-}
-*/
-
 static void walk_page_tables_hypercall(unsigned long address)
 {
     struct mm_struct *mm = current->mm;
@@ -676,27 +654,6 @@ static int fx_module_init(void)
 
     FX_DBG("fx_module_init: end\n");
 
-    /*
-    printk(
-        "**************************************************\n"
-        "current pgd %px -> 0x%lx\n"
-        "irq_action address %px -> 0x%lx\n"
-        "irqdesc %px -> 0x%lx\n"
-        "handle_fast_eoi_irq %px -> 0x%lx\n"
-        "irq handler %px -> 0x%lx\n"
-        "generic handle irq %px -> 0x%lx\n"
-        "common interrupt %px -> 0x%lx\n"
-        "**************************************************\n",
-        (void *)current->mm->pgd, __pa(current->mm->pgd),
-        (void *)irqaction_pci, __pa(irqaction_pci),
-        (void *)irq_desc_pci, __pa(irq_desc_pci), 
-        (void *)kln_pointer("handle_fasteoi_irq"), __pa(kln_pointer("handle_fasteoi_irq")),
-        (void *)fx_irq_handler, __pa(fx_irq_handler),
-        (void *)kln_pointer("generic_handle_irq"), __pa(kln_pointer("generic_handle_irq")),
-        (void *)kln_pointer("__common_interrupt"),__pa(kln_pointer("__common_interrupt"))
-        );
-
-    */
 
     return 0;
 }
