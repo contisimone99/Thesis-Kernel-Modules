@@ -24,6 +24,21 @@ Now prepare all the headers (the last 2 command will take some time to complete)
     # 2. generate x86_64 config
     make x86_64_defconfig
 
+
+    # 2.1 abilita memory hotplug
+    scripts/config --enable CONFIG_MEMORY_HOTPLUG
+    scripts/config --enable CONFIG_MEMORY_HOTREMOVE
+
+    # 2.2 online automatico della memoria
+    scripts/config --enable CONFIG_MEMORY_HOTPLUG_DEFAULT_ONLINE
+
+    # 2.3 virtio-mem
+    scripts/config --enable CONFIG_VIRTIO_MEM
+
+    # 2.4 assicura virtio core
+    scripts/config --enable CONFIG_VIRTIO
+    scripts/config --enable CONFIG_VIRTIO_PCI
+
     # 3. prepare necessary file for build
     make prepare
 
@@ -36,5 +51,8 @@ Now prepare all the headers (the last 2 command will take some time to complete)
     # 6. compile kernel modules
     make -j"$(nproc)" modules
 ```
+
+
+
 
 
