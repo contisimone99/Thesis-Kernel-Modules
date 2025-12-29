@@ -1,4 +1,0 @@
-[submodule "linux"]
-	path = linux
-	url = https://github.com/contisimone99/linux
-	branch = guest-6.6
