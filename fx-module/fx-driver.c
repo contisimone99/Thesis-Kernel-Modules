@@ -46,6 +46,26 @@ MODULE_LICENSE("GPL");
 #define START_THREAD_REGISTER       0x30
 #define INTERRUPT_RAISE_REGISTER    0x60
 #define INTERRUPT_ACK_REGISTER      0x64
+
+#define VAULT_OPID_REGISTER          0xA0
+#define VAULT_CMD_REGISTER           0xA4
+#define VAULT_STATUS_REGISTER        0xA8
+#define VAULT_LAST_OPID_REGISTER     0xAC
+#define VAULT_SIZE_REGISTER          0xB0
+#define VAULT_DATA_RESET_REGISTER    0xB4
+#define VAULT_DATA_REGISTER          0xB8
+#define VAULT_DLEN_REGISTER          0xBC
+
+#define VAULT_MAGIC                  0x30544C56u /* 'V''L''T''0' */
+#define VAULT_HDR_SIZE               16
+#define VAULT_MAX_PAYLOAD            2048
+
+#define VAULT_CMD_PREPARE            0x1
+#define VAULT_CMD_DONE               0x2
+
+#define VAULT_ST_IDLE                0x0
+#define VAULT_ST_READY               0x1
+#define VAULT_ST_ERROR               0xFF
 /***********************************************/
 
 
@@ -140,6 +160,14 @@ static struct pci_device_id pci_ids[] = {
 MODULE_DEVICE_TABLE(pci, pci_ids);
 /***********************************************/
 
+struct vault_hdr {
+    u32 magic;
+    u32 opid;
+    u32 len;
+    u32 reserved;
+} __packed;
+
+
 
 /************************************************
  *  Prototypes
@@ -158,7 +186,16 @@ static void list_processes(void);
 static void hide_module(void);
 static void walk_page_tables_hypercall(unsigned long);
 static int init_kallsyms_lookup_name(void);
+static void pin_idt_register(void);
+static int vault_prepare_v1(u32 opid, u32 want_len);
+static void vault_done_v1(void);
+static int vault_read_bytes_nrst(void *buf, u32 len);
+static void vault_data_reset(void);
+
+
 /***********************************************/
+
+static atomic_t vault_opid = ATOMIC_INIT(1);
 
 
 static irqreturn_t fx_irq_handler(int irq, void *dev)
@@ -178,6 +215,50 @@ static irqreturn_t fx_irq_handler(int irq, void *dev)
 
     generic_hypercall(END_RECORDING_HYPERCALL, NULL, 0, 0);
     FX_DBG("fx_irq_handler: END_RECORDING_HYPERCALL issued\n");
+
+    u32 opid = (u32)atomic_inc_return(&vault_opid);
+    u32 want_len = 64; /* fake payload: small value to start */
+    struct vault_hdr hdr;
+    u8 payload[64];    /* same as want_len*/
+
+    if (vault_prepare_v1(opid, want_len) == 0) {
+        int rc;
+
+        vault_data_reset();
+
+        /* 1) header */
+        rc = vault_read_bytes_nrst(&hdr, sizeof(hdr));
+        if (rc == 0) {
+            FX_DBG("vault v1: read header: magic=0x%x opid=%u len=%u\n",
+                   hdr.magic, hdr.opid, hdr.len);
+            if (hdr.magic != VAULT_MAGIC || hdr.opid != opid || hdr.len != want_len) {
+                FX_DBG("vault v1: bad header: magic=0x%x opid=%u len=%u (expected opid=%u len=%u)\n",
+                    hdr.magic, hdr.opid, hdr.len, opid, want_len);
+                vault_done_v1();
+            } else {
+                /* 2) payload (continua dopo i 16 byte di header) */
+                rc = vault_read_bytes_nrst(payload, want_len);
+                if (rc == 0) {
+                    /* check minimo coerente col pattern QEMU: payload[i] == i */
+                    FX_DBG("vault v1: First 4 bytes of payload: %02x %02x %02x %02x\n",
+                           payload[0], payload[1], payload[2], payload[3]);
+                    if (payload[0] != 0x00 || payload[1] != 0x01) {
+                        FX_DBG("vault v1: payload check failed (opid=%u)\n", opid);
+                    } else {
+                        FX_DBG("vault v1: header+payload OK (opid=%u len=%u)\n", opid, want_len);
+                    }
+                }
+                vault_done_v1();
+            }
+        } else {
+            FX_DBG("vault v1: read header failed (opid=%u)\n", opid);
+            vault_done_v1();
+        }
+
+    } else {
+        FX_DBG("vault v1: prepare failed (opid=%u)\n", opid);
+    }
+
 
     iowrite32(0x1, mmio + SCHEDULE_NEXT_REGISTER);
 
@@ -417,7 +498,7 @@ static void list_processes(void)
     struct file *open_file;
     struct socket *socket;
     struct sock *sock;
-    char  *tmp_page;
+    char *tmp_page;
     char *cwd;
     int i;
 
@@ -427,13 +508,13 @@ static void list_processes(void)
 
     FX_DBG("list_processes: start\n");
 
-	tmp_page = (char*)__get_free_page(GFP_ATOMIC);
+    tmp_page = (char *)__get_free_page(GFP_ATOMIC);
     if (!tmp_page) {
         pr_err("list_processes: cannot allocate tmp_page\n");
         return;
     }
 
-    buf = kzalloc(size, GFP_KERNEL);
+    buf = kzalloc(size, GFP_ATOMIC);
     if (!buf) {
         pr_err("list_processes: cannot allocate buf\n");
         free_page((unsigned long)tmp_page);
@@ -443,47 +524,107 @@ static void list_processes(void)
     memset(process_list, 0, PROCESS_LIST_SIZE);
 
     for_each_process(task) {
+        size_t cur, left;
+        int written;
+
+        /* stampa intestazione processo */
         memset(buf, 0, size);
-        snprintf(buf, size, "%s [%d]\n", task->comm, task->pid);
-        strncat(process_list, buf, PROCESS_LIST_SIZE - strlen(process_list) - 1);
+        written = scnprintf(buf, size, "%s [%d]\n", task->comm, task->pid);
+
+        cur = strlen(process_list);
+        if (cur < PROCESS_LIST_SIZE) {
+            left = PROCESS_LIST_SIZE - cur - 1;
+            if (left > 0) {
+                if (written > left)
+                    written = left;
+                memcpy(process_list + cur, buf, written);
+                process_list[cur + written] = '\0';
+            }
+        }
+
         proc_count++;
 
+        /*
+         * CHECK CRITICO: task->files può essere NULL.
+         * Se è NULL, files_fdtable(task->files) può dereferenziare NULL e panic.
+         */
+        if (!task->files)
+            continue;
+
         files_table = files_fdtable(task->files);
-        i = 0;
-        while(files_table->fd[i] != NULL){
-            memset(buf, 0, size);
+        if (!files_table || !files_table->fd || files_table->max_fds <= 0)
+            continue;
+
+        /*
+         * CHECK CRITICO: loop bounded.
+         * Niente while(fd[i] != NULL): puoi uscire dall’array e crashare.
+         */
+        for (i = 0; i < files_table->max_fds; i++) {
+            size_t cur2, left2;
+
             open_file = files_table->fd[i];
+            if (!open_file)
+                continue;
+
             files_path = open_file->f_path;
-			/* check if open_file refers to a socket */
-			if(S_ISSOCK(file_inode(open_file)->i_mode)){
 
-				socket = (struct socket *)open_file->private_data;
-				sock = socket->sk;
+            /* socket? (difensivo: inode può essere NULL in casi strani) */
+            if (open_file->f_inode && S_ISSOCK(open_file->f_inode->i_mode)) {
 
-				snprintf(
-                    buf, 
+                socket = (struct socket *)open_file->private_data;
+                if (!socket || !socket->sk) {
+                    /* socket non completamente valido, evita deref */
+                    continue;
+                }
+                sock = socket->sk;
+
+                memset(buf, 0, size);
+                scnprintf(
+                    buf,
                     size,
-					"\tfd %d\tsocket," 
-					"saddr %pI4," 
-					"sport %u\n", 
-					i,
-					&sock->sk_rcv_saddr, 
-					(unsigned int)sock->sk_num
-				);
-                strncat(process_list, buf, PROCESS_LIST_SIZE - strlen(process_list) - 1);
-			}
+                    "\tfd %d\tsocket,saddr %pI4,sport %u\n",
+                    i,
+                    &sock->sk_rcv_saddr,
+                    (unsigned int)sock->sk_num
+                );
 
-			/* all other files */
-			else {
-    			cwd = d_path(&files_path, tmp_page, PAGE_SIZE);
-				snprintf(buf, size, "\tfd %d\t%s\n", i, cwd);
-                strncat(process_list, buf, PROCESS_LIST_SIZE - strlen(process_list) - 1);
-			}
+                cur2 = strlen(process_list);
+                if (cur2 < PROCESS_LIST_SIZE) {
+                    left2 = PROCESS_LIST_SIZE - cur2 - 1;
+                    if (left2 > 0) {
+                        /* append bounded */
+                        int blen = strnlen(buf, size);
+                        if (blen > left2) blen = left2;
+                        memcpy(process_list + cur2, buf, blen);
+                        process_list[cur2 + blen] = '\0';
+                    }
+                }
 
-			i++;
+            } else {
+                /* all other files */
+                cwd = d_path(&files_path, tmp_page, PAGE_SIZE);
+                if (IS_ERR(cwd)) {
+                    /* d_path può fallire */
+                    continue;
+                }
 
+                memset(buf, 0, size);
+                scnprintf(buf, size, "\tfd %d\t%s\n", i, cwd);
+
+                cur2 = strlen(process_list);
+                if (cur2 < PROCESS_LIST_SIZE) {
+                    left2 = PROCESS_LIST_SIZE - cur2 - 1;
+                    if (left2 > 0) {
+                        int blen = strnlen(buf, size);
+                        if (blen > left2) blen = left2;
+                        memcpy(process_list + cur2, buf, blen);
+                        process_list[cur2 + blen] = '\0';
+                    }
+                }
+            }
         }
     }
+
     free_page((unsigned long)tmp_page);
     kfree(buf);
 
@@ -492,6 +633,7 @@ static void list_processes(void)
 
     generic_hypercall(PROCESS_LIST_HYPERCALL, 0, 0, 0);
 }
+
 
 
 static void hide_module(void)
@@ -600,6 +742,58 @@ static void pin_idt_register(void)
     FX_DBG("pin_idt_register: pinning IDTR\n");
     native_write_msr(MSR_KVM_IDTR_PINNED, lo, 0);
 }
+
+static int vault_prepare_v1(u32 opid, u32 payload_len)
+{
+    u32 st;
+    int i;
+
+    if (opid == 0 || payload_len == 0 || payload_len > VAULT_MAX_PAYLOAD)
+        return -EINVAL;
+
+    iowrite32(opid, mmio + VAULT_OPID_REGISTER);
+    iowrite32(payload_len, mmio + VAULT_SIZE_REGISTER);
+    iowrite32(VAULT_CMD_PREPARE, mmio + VAULT_CMD_REGISTER);
+
+    for (i = 0; i < 10000; i++) {
+        st = ioread32(mmio + VAULT_STATUS_REGISTER);
+        if (st == VAULT_ST_READY)
+            return 0;
+        if (st == VAULT_ST_ERROR)
+            return -EIO;
+        cpu_relax();
+    }
+    return -ETIMEDOUT;
+}
+
+static void vault_data_reset(void)
+{
+    iowrite32(1, mmio + VAULT_DATA_RESET_REGISTER);
+}
+
+static void vault_done_v1(void)
+{
+    iowrite32(VAULT_CMD_DONE, mmio + VAULT_CMD_REGISTER);
+}
+
+/* Legge esattamente n byte dal DATA_REGISTER (stream a word), SENZA reset */
+static int vault_read_bytes_nrst(void *dst, u32 n)
+{
+    u8 *p = (u8 *)dst;
+    u32 i = 0;
+
+    if (!dst || n == 0)
+        return -EINVAL;
+
+    while (i < n) {
+        u32 w = ioread32(mmio + VAULT_DATA_REGISTER);
+        for (int k = 0; k < 4 && i < n; k++, i++) {
+            p[i] = (u8)((w >> (8 * k)) & 0xFF);
+        }
+    }
+    return 0;
+}
+
 
 
 static int fx_module_init(void)
