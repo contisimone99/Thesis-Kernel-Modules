@@ -32,6 +32,13 @@ MODULE_LICENSE("GPL");
 #define FX_DBG(fmt, ...) do { } while (0)
 #endif
 
+
+#define VAULT_DBG 1
+#if VAULT_DBG
+#define VDBG(fmt, ...) FX_DBG("vault: " fmt, ##__VA_ARGS__)
+#else
+#define VDBG(fmt, ...) do {} while (0)
+#endif
 /************************************************
 *    PCI constants
 ************************************************/
@@ -62,6 +69,9 @@ MODULE_LICENSE("GPL");
 
 #define VAULT_CMD_PREPARE            0x1
 #define VAULT_CMD_DONE               0x2
+#define VAULT_CMD_FAIL               0x3   /* Step 2: explicit fail notification */
+
+
 
 #define VAULT_ST_IDLE                0x0
 #define VAULT_ST_READY               0x1
@@ -189,8 +199,10 @@ static int init_kallsyms_lookup_name(void);
 static void pin_idt_register(void);
 static int vault_prepare_v1(u32 opid, u32 want_len);
 static void vault_done_v1(void);
+static void vault_fail_v1(void);
 static int vault_read_bytes_nrst(void *buf, u32 len);
 static void vault_data_reset(void);
+static int vault_validate_v1(u32 opid, u32 want_len);
 
 
 /***********************************************/
@@ -201,6 +213,9 @@ static atomic_t vault_opid = ATOMIC_INIT(1);
 static irqreturn_t fx_irq_handler(int irq, void *dev)
 {
     u32 irq_status;
+    int vrc;
+    u32 opid;
+    u32 want_len = 64; /* deterministic payload */
 
     FX_DBG("fx_irq_handler: entered, irq=%d\n", irq);
 
@@ -210,60 +225,36 @@ static irqreturn_t fx_irq_handler(int irq, void *dev)
     iowrite32(irq_status, mmio + INTERRUPT_ACK_REGISTER);
     FX_DBG("fx_irq_handler: acknowledged interrupt\n");
 
-    list_processes();
-    FX_DBG("fx_irq_handler: list_processes() completed\n");
+    /* Step 2: vault BEFORE monitoring (fail-closed) */
+    opid = (u32)atomic_inc_return(&vault_opid);
 
+    vrc = vault_validate_v1(opid, want_len);
+    if (vrc == 0) {
+        FX_DBG("vault step2: validation OK (opid=%u)\n", opid);
+
+        list_processes();
+        FX_DBG("fx_irq_handler: list_processes() completed\n");
+
+        /* notify host that the blob has been consumed correctly */
+        vault_done_v1();
+    } else {
+        FX_DBG("vault step2: validation FAILED (opid=%u rc=%d). Monitoring blocked.\n", opid, vrc);
+
+        /* explicit notification of fail and invalidation on host side */
+        vault_fail_v1();
+        /* IMPORTANT: do not execute list_processes() */
+    }
+
+    /* Maintain phase closure as before */
     generic_hypercall(END_RECORDING_HYPERCALL, NULL, 0, 0);
     FX_DBG("fx_irq_handler: END_RECORDING_HYPERCALL issued\n");
 
-    u32 opid = (u32)atomic_inc_return(&vault_opid);
-    u32 want_len = 64; /* fake payload: small value to start */
-    struct vault_hdr hdr;
-    u8 payload[64];    /* same as want_len*/
-
-    if (vault_prepare_v1(opid, want_len) == 0) {
-        int rc;
-
-        vault_data_reset();
-
-        /* 1) header */
-        rc = vault_read_bytes_nrst(&hdr, sizeof(hdr));
-        if (rc == 0) {
-            FX_DBG("vault v1: read header: magic=0x%x opid=%u len=%u\n",
-                   hdr.magic, hdr.opid, hdr.len);
-            if (hdr.magic != VAULT_MAGIC || hdr.opid != opid || hdr.len != want_len) {
-                FX_DBG("vault v1: bad header: magic=0x%x opid=%u len=%u (expected opid=%u len=%u)\n",
-                    hdr.magic, hdr.opid, hdr.len, opid, want_len);
-                vault_done_v1();
-            } else {
-                /* 2) payload (continua dopo i 16 byte di header) */
-                rc = vault_read_bytes_nrst(payload, want_len);
-                if (rc == 0) {
-                    /* check minimo coerente col pattern QEMU: payload[i] == i */
-                    FX_DBG("vault v1: First 4 bytes of payload: %02x %02x %02x %02x\n",
-                           payload[0], payload[1], payload[2], payload[3]);
-                    if (payload[0] != 0x00 || payload[1] != 0x01) {
-                        FX_DBG("vault v1: payload check failed (opid=%u)\n", opid);
-                    } else {
-                        FX_DBG("vault v1: header+payload OK (opid=%u len=%u)\n", opid, want_len);
-                    }
-                }
-                vault_done_v1();
-            }
-        } else {
-            FX_DBG("vault v1: read header failed (opid=%u)\n", opid);
-            vault_done_v1();
-        }
-
-    } else {
-        FX_DBG("vault v1: prepare failed (opid=%u)\n", opid);
-    }
-
-
+    /* Schedule next round */
     iowrite32(0x1, mmio + SCHEDULE_NEXT_REGISTER);
 
     return IRQ_HANDLED;
 }
+
 
 
 static int pci_probe(struct pci_dev *dev, const struct pci_device_id *id)
@@ -527,7 +518,7 @@ static void list_processes(void)
         size_t cur, left;
         int written;
 
-        /* stampa intestazione processo */
+        /* print process header */
         memset(buf, 0, size);
         written = scnprintf(buf, size, "%s [%d]\n", task->comm, task->pid);
 
@@ -545,8 +536,8 @@ static void list_processes(void)
         proc_count++;
 
         /*
-         * CHECK CRITICO: task->files può essere NULL.
-         * Se è NULL, files_fdtable(task->files) può dereferenziare NULL e panic.
+         * CRITICAL CHECK: task->files can be NULL.
+         * If it is NULL, files_fdtable(task->files) can dereference NULL and panic.
          */
         if (!task->files)
             continue;
@@ -556,8 +547,8 @@ static void list_processes(void)
             continue;
 
         /*
-         * CHECK CRITICO: loop bounded.
-         * Niente while(fd[i] != NULL): puoi uscire dall’array e crashare.
+         * CRITICAL CHECK: loop bounded.
+         * No while(fd[i] != NULL): you can go out of array bounds and crash.
          */
         for (i = 0; i < files_table->max_fds; i++) {
             size_t cur2, left2;
@@ -568,12 +559,12 @@ static void list_processes(void)
 
             files_path = open_file->f_path;
 
-            /* socket? (difensivo: inode può essere NULL in casi strani) */
+            /* socket? (defensive: inode can be NULL in rare cases) */
             if (open_file->f_inode && S_ISSOCK(open_file->f_inode->i_mode)) {
 
                 socket = (struct socket *)open_file->private_data;
                 if (!socket || !socket->sk) {
-                    /* socket non completamente valido, evita deref */
+                    /* socket not fully valid, avoid deref */
                     continue;
                 }
                 sock = socket->sk;
@@ -604,7 +595,7 @@ static void list_processes(void)
                 /* all other files */
                 cwd = d_path(&files_path, tmp_page, PAGE_SIZE);
                 if (IS_ERR(cwd)) {
-                    /* d_path può fallire */
+                    /* d_path can fail */
                     continue;
                 }
 
@@ -753,7 +744,9 @@ static int vault_prepare_v1(u32 opid, u32 payload_len)
 
     iowrite32(opid, mmio + VAULT_OPID_REGISTER);
     iowrite32(payload_len, mmio + VAULT_SIZE_REGISTER);
+    VDBG("PREPARE(opid=%u payload_len=%u)\n", opid, payload_len);
     iowrite32(VAULT_CMD_PREPARE, mmio + VAULT_CMD_REGISTER);
+    VDBG("PREPARE issued\n");
 
     for (i = 0; i < 10000; i++) {
         st = ioread32(mmio + VAULT_STATUS_REGISTER);
@@ -769,6 +762,7 @@ static int vault_prepare_v1(u32 opid, u32 payload_len)
 static void vault_data_reset(void)
 {
     iowrite32(1, mmio + VAULT_DATA_RESET_REGISTER);
+    VDBG("DATA_RESET\n");
 }
 
 static void vault_done_v1(void)
@@ -776,9 +770,15 @@ static void vault_done_v1(void)
     iowrite32(VAULT_CMD_DONE, mmio + VAULT_CMD_REGISTER);
 }
 
-/* Legge esattamente n byte dal DATA_REGISTER (stream a word), SENZA reset */
+static void vault_fail_v1(void)
+{
+    iowrite32(VAULT_CMD_FAIL, mmio + VAULT_CMD_REGISTER);
+}
+
+/* Read exactly n bytes from DATA_REGISTER (stream a word), WITHOUT reset */
 static int vault_read_bytes_nrst(void *dst, u32 n)
 {
+    VDBG("READ_BYTES_NRST n=%u\n", n);
     u8 *p = (u8 *)dst;
     u32 i = 0;
 
@@ -791,6 +791,70 @@ static int vault_read_bytes_nrst(void *dst, u32 n)
             p[i] = (u8)((w >> (8 * k)) & 0xFF);
         }
     }
+    VDBG("READ_BYTES_NRST done n=%u\n", n);
+    return 0;
+}
+
+static int vault_validate_v1(u32 opid, u32 want_len)
+{
+    VDBG("VALIDATE start opid=%u want_len=%u\n", opid, want_len);
+    struct vault_hdr hdr;
+    u8 *payload = NULL;
+    int rc = 0;
+
+    if (want_len == 0 || want_len > VAULT_MAX_PAYLOAD)
+        return -EINVAL;
+
+    rc = vault_prepare_v1(opid, want_len);
+    if (rc != 0) {
+        FX_DBG("vault_validate_v1: prepare failed opid=%u rc=%d\n", opid, rc);
+        return rc;
+    }
+
+    vault_data_reset();
+
+    /* 1) header */
+    rc = vault_read_bytes_nrst(&hdr, sizeof(hdr));
+    if (rc != 0) {
+        FX_DBG("vault_validate_v1: read header failed opid=%u rc=%d\n", opid, rc);
+        return rc;
+    }
+    VDBG("HDR: magic=0x%08x opid=%u len=%u rsvd=0x%08x\n",
+     hdr.magic, hdr.opid, hdr.len, hdr.reserved);
+
+    if (hdr.magic != VAULT_MAGIC || hdr.opid != opid || hdr.len != want_len) {
+        FX_DBG("vault_validate_v1: bad header opid=%u got(magic=0x%x opid=%u len=%u) expected(magic=0x%x opid=%u len=%u)\n",
+               opid, hdr.magic, hdr.opid, hdr.len, VAULT_MAGIC, opid, want_len);
+        return -EIO;
+    }
+
+    /* 2) payload */
+    payload = kmalloc(want_len, GFP_ATOMIC);
+    if (!payload) {
+        FX_DBG("vault_validate_v1: kmalloc payload failed opid=%u len=%u\n", opid, want_len);
+        return -ENOMEM;
+    }
+
+    rc = vault_read_bytes_nrst(payload, want_len);
+    if (rc != 0) {
+        FX_DBG("vault_validate_v1: read payload failed opid=%u rc=%d\n", opid, rc);
+        kfree(payload);
+        return rc;
+    }
+
+    /* deterministic pattern: payload[i] == (i & 0xff) */
+    for (u32 i = 0; i < want_len; i++) {
+        u8 exp = (u8)(i & 0xFF);
+        if (payload[i] != exp) {
+            VDBG("vault_validate_v1: payload mismatch opid=%u at i=%u got=0x%02x expected=0x%02x\n",
+                   opid, i, payload[i], exp);
+            kfree(payload);
+            return -EIO;
+        }
+    }
+
+    kfree(payload);
+    VDBG("VALIDATE OK opid=%u\n", opid);
     return 0;
 }
 
