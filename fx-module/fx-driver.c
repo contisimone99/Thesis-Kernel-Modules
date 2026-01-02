@@ -19,6 +19,8 @@
 #include <linux/dcache.h>
 #include <linux/slab.h>
 #include <linux/net.h>
+#include <linux/workqueue.h>
+#include <linux/atomic.h>
 #include <net/sock.h>
 
 MODULE_AUTHOR("Simone Conti");
@@ -70,6 +72,7 @@ MODULE_LICENSE("GPL");
 #define VAULT_CMD_PREPARE            0x1
 #define VAULT_CMD_DONE               0x2
 #define VAULT_CMD_FAIL               0x3   /* Step 2: explicit fail notification */
+#define VAULT_CMD_RESET              0x4   /* Step 3.x: recovery to IDLE */
 
 
 
@@ -159,6 +162,10 @@ static int do_register_kprobe(struct kprobe *kp, char *symbol_name, void *handle
 ************************************************/
 static struct pci_dev *pdev; /* PCI device */
 static void __iomem *mmio; /* memory mapped I/O */
+/* Step 3.1: move heavy logic out of IRQ */
+static struct work_struct monitoring_work;
+/* 0 = idle, 1 = work scheduled/running */
+static atomic_t monitoring_work_inflight = ATOMIC_INIT(0);
 static int pci_irq;
 static struct irq_desc *irq_desc_pci;
 static struct irqaction *irqaction_pci;
@@ -203,6 +210,10 @@ static void vault_fail_v1(void);
 static int vault_read_bytes_nrst(void *buf, u32 len);
 static void vault_data_reset(void);
 static int vault_validate_v1(u32 opid, u32 want_len);
+static void monitoring_work_fn(struct work_struct *work);
+static void vault_reset_v1(void);
+
+
 
 
 /***********************************************/
@@ -213,9 +224,6 @@ static atomic_t vault_opid = ATOMIC_INIT(1);
 static irqreturn_t fx_irq_handler(int irq, void *dev)
 {
     u32 irq_status;
-    int vrc;
-    u32 opid;
-    u32 want_len = 64; /* deterministic payload */
 
     FX_DBG("fx_irq_handler: entered, irq=%d\n", irq);
 
@@ -225,7 +233,29 @@ static irqreturn_t fx_irq_handler(int irq, void *dev)
     iowrite32(irq_status, mmio + INTERRUPT_ACK_REGISTER);
     FX_DBG("fx_irq_handler: acknowledged interrupt\n");
 
-    /* Step 2: vault BEFORE monitoring (fail-closed) */
+    /*
+     * Step 3.1: schedule heavy logic in process context.
+     * Avoid re-entrancy: if already scheduled/running, skip.
+     */
+    if (atomic_cmpxchg(&monitoring_work_inflight, 0, 1) == 0) {
+        schedule_work(&monitoring_work);
+        FX_DBG("fx_irq_handler: scheduled monitoring_work\n");
+    } else {
+        FX_DBG("fx_irq_handler: monitoring_work already inflight, skipping\n");
+    }
+
+    return IRQ_HANDLED;
+}
+
+static void monitoring_work_fn(struct work_struct *work)
+{
+    int vrc;
+    u32 opid;
+    u32 want_len = 64; /* payload size for now */
+
+    FX_DBG("monitoring_work: start\n");
+
+    /* Step 2: vault gating (fail-closed) */
     opid = (u32)atomic_inc_return(&vault_opid);
 
     vrc = vault_validate_v1(opid, want_len);
@@ -233,26 +263,27 @@ static irqreturn_t fx_irq_handler(int irq, void *dev)
         FX_DBG("vault step2: validation OK (opid=%u)\n", opid);
 
         list_processes();
-        FX_DBG("fx_irq_handler: list_processes() completed\n");
+        FX_DBG("monitoring_work: list_processes() completed\n");
 
-        /* notify host that the blob has been consumed correctly */
+        /* DONE only after full read: validate already consumed header+payload */
         vault_done_v1();
     } else {
         FX_DBG("vault step2: validation FAILED (opid=%u rc=%d). Monitoring blocked.\n", opid, vrc);
-
-        /* explicit notification of fail and invalidation on host side */
         vault_fail_v1();
-        /* IMPORTANT: do not execute list_processes() */
+        /* IMPORTANT: do not run list_processes() */
     }
 
-    /* Maintain phase closure as before */
+    /* Keep legacy flow (as before), but now in process context */
     generic_hypercall(END_RECORDING_HYPERCALL, NULL, 0, 0);
-    FX_DBG("fx_irq_handler: END_RECORDING_HYPERCALL issued\n");
+    FX_DBG("monitoring_work: END_RECORDING_HYPERCALL issued\n");
 
-    /* Schedule next round */
+    /* schedule next cycle */
     iowrite32(0x1, mmio + SCHEDULE_NEXT_REGISTER);
 
-    return IRQ_HANDLED;
+    /* allow next IRQ to schedule work again */
+    atomic_set(&monitoring_work_inflight, 0);
+
+    FX_DBG("monitoring_work: end\n");
 }
 
 
@@ -283,7 +314,8 @@ static int pci_probe(struct pci_dev *dev, const struct pci_device_id *id)
         return -1;
     }
     FX_DBG("pci_probe: mmio mapped at %px\n", mmio);
-
+    INIT_WORK(&monitoring_work, monitoring_work_fn);
+    atomic_set(&monitoring_work_inflight, 0);
 	/* IRQ setup */
 	pci_read_config_byte(dev, PCI_INTERRUPT_LINE, &val);
 	pci_irq = val;
@@ -775,6 +807,12 @@ static void vault_fail_v1(void)
     iowrite32(VAULT_CMD_FAIL, mmio + VAULT_CMD_REGISTER);
 }
 
+static void vault_reset_v1(void)
+{
+    VDBG("RESET\n");
+    iowrite32(VAULT_CMD_RESET, mmio + VAULT_CMD_REGISTER);
+}
+
 /* Read exactly n bytes from DATA_REGISTER (stream a word), WITHOUT reset */
 static int vault_read_bytes_nrst(void *dst, u32 n)
 {
@@ -805,6 +843,9 @@ static int vault_validate_v1(u32 opid, u32 want_len)
     if (want_len == 0 || want_len > VAULT_MAX_PAYLOAD)
         return -EINVAL;
 
+    /* Ensure QEMU side is back to IDLE if it was left in ERROR */
+    vault_reset_v1();
+    
     rc = vault_prepare_v1(opid, want_len);
     if (rc != 0) {
         FX_DBG("vault_validate_v1: prepare failed opid=%u rc=%d\n", opid, rc);
