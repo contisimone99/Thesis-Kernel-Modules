@@ -64,6 +64,7 @@ MODULE_LICENSE("GPL");
 #define VAULT_DATA_RESET_REGISTER    0xB4
 #define VAULT_DATA_REGISTER          0xB8
 #define VAULT_DLEN_REGISTER          0xBC
+#define VAULT_ERR_REGISTER           0xC0  /* read-only */
 
 #define VAULT_MAGIC                  0x30544C56u /* 'V''L''T''0' */
 #define VAULT_HDR_SIZE               16
@@ -75,10 +76,12 @@ MODULE_LICENSE("GPL");
 #define VAULT_CMD_RESET              0x4   /* Step 3.x: recovery to IDLE */
 
 
-
-#define VAULT_ST_IDLE                0x0
-#define VAULT_ST_READY               0x1
-#define VAULT_ST_ERROR               0xFF
+#define VAULT_STATUS_STATE_MASK      0x3
+#define VAULT_STATUS_STATE_IDLE      0x0
+#define VAULT_STATUS_STATE_READY     0x1
+#define VAULT_STATUS_STATE_ERROR     0x2
+#define VAULT_STATUS_BLOB_PRESENT    (1u << 2)
+#define VAULT_STATUS_BUSY            (1u << 3)
 /***********************************************/
 
 
@@ -214,7 +217,33 @@ static void monitoring_work_fn(struct work_struct *work);
 static void vault_reset_v1(void);
 
 
+static inline u32 vault_status_raw(void)
+{
+    return ioread32(mmio + VAULT_STATUS_REGISTER);
+}
 
+static inline u32 vault_state(void)
+{
+    return vault_status_raw() & VAULT_STATUS_STATE_MASK;
+}
+
+static inline u32 vault_err(void)
+{
+    return ioread32(mmio + VAULT_ERR_REGISTER);
+}
+
+static void vault_dump_status(const char *tag)
+{
+    u32 st = ioread32(mmio + VAULT_STATUS_REGISTER);
+    u32 e  = ioread32(mmio + VAULT_ERR_REGISTER);
+    FX_DBG("vault: STATUS[%s]=0x%08x state=%u blob=%u busy=%u ERR=%u\n",
+           tag,
+           st,
+           st & VAULT_STATUS_STATE_MASK,
+           !!(st & VAULT_STATUS_BLOB_PRESENT),
+           !!(st & VAULT_STATUS_BUSY),
+           e);
+}
 
 /***********************************************/
 
@@ -266,7 +295,10 @@ static void monitoring_work_fn(struct work_struct *work)
         FX_DBG("monitoring_work: list_processes() completed\n");
 
         /* DONE only after full read: validate already consumed header+payload */
+
+        vault_dump_status("before_done");
         vault_done_v1();
+        
     } else {
         FX_DBG("vault step2: validation FAILED (opid=%u rc=%d). Monitoring blocked.\n", opid, vrc);
         vault_fail_v1();
@@ -332,15 +364,6 @@ static int pci_probe(struct pci_dev *dev, const struct pci_device_id *id)
 		return -1;
 	}
 
-    /* TEST 
-    generic_hypercall(START_TIMER_HYPERCALL, 0, 0, 0);
-    // test hypercall times 
-    for(i = 0; i < 100000; i++)
-        generic_hypercall(EMPTY_HYPERCALL, 0, 0, 0);
-    generic_hypercall(STOP_TIMER_HYPERCALL, 0, 0, 0);
-    */
-
-    /* starting the thread in the emulated device */
     iowrite32(0x1, mmio + START_THREAD_REGISTER);
 
     return 0;
@@ -781,11 +804,14 @@ static int vault_prepare_v1(u32 opid, u32 payload_len)
     VDBG("PREPARE issued\n");
 
     for (i = 0; i < 10000; i++) {
-        st = ioread32(mmio + VAULT_STATUS_REGISTER);
-        if (st == VAULT_ST_READY)
+        st = vault_status_raw();
+        if ((st & VAULT_STATUS_STATE_MASK) == VAULT_STATUS_STATE_READY)
             return 0;
-        if (st == VAULT_ST_ERROR)
+        if ((st & VAULT_STATUS_STATE_MASK) == VAULT_STATUS_STATE_ERROR) {
+            u32 e = vault_err();
+            FX_DBG("vault_prepare_v1: device in ERROR, VAULT_ERR=%u (status=0x%x)\n", e, st);
             return -EIO;
+        }
         cpu_relax();
     }
     return -ETIMEDOUT;
@@ -845,12 +871,13 @@ static int vault_validate_v1(u32 opid, u32 want_len)
 
     /* Ensure QEMU side is back to IDLE if it was left in ERROR */
     vault_reset_v1();
-    
+    vault_dump_status("after_reset");
     rc = vault_prepare_v1(opid, want_len);
     if (rc != 0) {
         FX_DBG("vault_validate_v1: prepare failed opid=%u rc=%d\n", opid, rc);
         return rc;
     }
+    vault_dump_status("after_prepare");
 
     vault_data_reset();
 
@@ -862,6 +889,7 @@ static int vault_validate_v1(u32 opid, u32 want_len)
     }
     VDBG("HDR: magic=0x%08x opid=%u len=%u rsvd=0x%08x\n",
      hdr.magic, hdr.opid, hdr.len, hdr.reserved);
+
 
     if (hdr.magic != VAULT_MAGIC || hdr.opid != opid || hdr.len != want_len) {
         FX_DBG("vault_validate_v1: bad header opid=%u got(magic=0x%x opid=%u len=%u) expected(magic=0x%x opid=%u len=%u)\n",
