@@ -22,6 +22,10 @@
 #include <linux/workqueue.h>
 #include <linux/atomic.h>
 #include <net/sock.h>
+#include <linux/io.h>
+#include <linux/uaccess.h>
+#include <linux/memremap.h>
+#include <linux/nospec.h>
 
 MODULE_AUTHOR("Simone Conti");
 MODULE_LICENSE("GPL");
@@ -82,6 +86,12 @@ MODULE_LICENSE("GPL");
 #define VAULT_STATUS_STATE_ERROR     0x2
 #define VAULT_STATUS_BLOB_PRESENT    (1u << 2)
 #define VAULT_STATUS_BUSY            (1u << 3)
+
+/* Step 5 (virtio-mem): fixed GPA must match QEMU memaddr */
+#define VAULT_MEMADDR_GPA            0x100000000ULL
+#define VAULT_VMEM_BLOCK_SIZE        (2 * 1024 * 1024UL)
+#define VAULT_MAP_MAX                (2 * 1024 * 1024UL) /* map 2MB at a time (enough for our blob) */
+
 /***********************************************/
 
 
@@ -210,8 +220,6 @@ static void pin_idt_register(void);
 static int vault_prepare_v1(u32 opid, u32 want_len);
 static void vault_done_v1(void);
 static void vault_fail_v1(void);
-static int vault_read_bytes_nrst(void *buf, u32 len);
-static void vault_data_reset(void);
 static int vault_validate_v1(u32 opid, u32 want_len);
 static void monitoring_work_fn(struct work_struct *work);
 static void vault_reset_v1(void);
@@ -292,14 +300,8 @@ static void monitoring_work_fn(struct work_struct *work)
         FX_DBG("vault step2: validation OK (opid=%u)\n", opid);
 
         list_processes();
-        FX_DBG("monitoring_work: list_processes() completed\n");
-
-        /* DONE only after full read: validate already consumed header+payload */
-
-        vault_dump_status("before_done");
-        vault_done_v1();
-        
-    } else {
+        FX_DBG("monitoring_work: list_processes() completed\n"); 
+    }else {
         FX_DBG("vault step2: validation FAILED (opid=%u rc=%d). Monitoring blocked.\n", opid, vrc);
         vault_fail_v1();
         /* IMPORTANT: do not run list_processes() */
@@ -817,11 +819,6 @@ static int vault_prepare_v1(u32 opid, u32 payload_len)
     return -ETIMEDOUT;
 }
 
-static void vault_data_reset(void)
-{
-    iowrite32(1, mmio + VAULT_DATA_RESET_REGISTER);
-    VDBG("DATA_RESET\n");
-}
 
 static void vault_done_v1(void)
 {
@@ -839,93 +836,143 @@ static void vault_reset_v1(void)
     iowrite32(VAULT_CMD_RESET, mmio + VAULT_CMD_REGISTER);
 }
 
-/* Read exactly n bytes from DATA_REGISTER (stream a word), WITHOUT reset */
-static int vault_read_bytes_nrst(void *dst, u32 n)
+
+
+static int vault_read_from_gpa(void *dst, u32 n)
 {
-    VDBG("READ_BYTES_NRST n=%u\n", n);
-    u8 *p = (u8 *)dst;
-    u32 i = 0;
+    void *p;
+    int rc;
 
     if (!dst || n == 0)
         return -EINVAL;
 
-    while (i < n) {
-        u32 w = ioread32(mmio + VAULT_DATA_REGISTER);
-        for (int k = 0; k < 4 && i < n; k++, i++) {
-            p[i] = (u8)((w >> (8 * k)) & 0xFF);
-        }
-    }
-    VDBG("READ_BYTES_NRST done n=%u\n", n);
-    return 0;
+    if (n > VAULT_MAP_MAX)
+        return -EINVAL;
+
+    p = memremap(VAULT_MEMADDR_GPA, n, MEMREMAP_WB);
+    if (!p)
+        return -ENOMEM;
+
+    /*
+     * Fault-safe read: copy_from_kernel_nofault() is the modern API.
+     * Returns 0 on success, -EFAULT on failure.
+     */
+    rc = copy_from_kernel_nofault(dst, p, n);
+
+    memunmap(p);
+    return rc;
 }
+
+
+static int vault_wait_header_ready(struct vault_hdr *hdr, unsigned int max_ms)
+{
+    unsigned int waited = 0;
+    int rc;
+
+    while (waited < max_ms) {
+        memset(hdr, 0, sizeof(*hdr));
+        rc = vault_read_from_gpa(hdr, sizeof(*hdr));
+        if (rc == 0 && hdr->magic == VAULT_MAGIC) {
+            return 0;
+        }
+        msleep(10);
+        waited += 10;
+    }
+    return -ETIMEDOUT;
+}
+
 
 static int vault_validate_v1(u32 opid, u32 want_len)
 {
-    VDBG("VALIDATE start opid=%u want_len=%u\n", opid, want_len);
+    int rc;
+    u32 dlen;
     struct vault_hdr hdr;
-    u8 *payload = NULL;
-    int rc = 0;
+    u8 *blob = NULL;
 
-    if (want_len == 0 || want_len > VAULT_MAX_PAYLOAD)
-        return -EINVAL;
+    VDBG("validate_v1: opid=%u want_len=%u\n", opid, want_len);
 
-    /* Ensure QEMU side is back to IDLE if it was left in ERROR */
     vault_reset_v1();
-    vault_dump_status("after_reset");
+
     rc = vault_prepare_v1(opid, want_len);
     if (rc != 0) {
         FX_DBG("vault_validate_v1: prepare failed opid=%u rc=%d\n", opid, rc);
         return rc;
     }
+
     vault_dump_status("after_prepare");
 
-    vault_data_reset();
+    dlen = ioread32(mmio + VAULT_DLEN_REGISTER);
+    if (dlen < VAULT_HDR_SIZE || dlen > (VAULT_HDR_SIZE + VAULT_MAX_PAYLOAD)) {
+        FX_DBG("vault_validate_v1: bad dlen=%u\n", dlen);
+        vault_fail_v1();
+        return -EINVAL;
+    }
 
-    /* 1) header */
-    rc = vault_read_bytes_nrst(&hdr, sizeof(hdr));
+    /* wait until memory is actually accessible and header is present */
+    rc = vault_wait_header_ready(&hdr, 2000 /*ms*/);
     if (rc != 0) {
-        FX_DBG("vault_validate_v1: read header failed opid=%u rc=%d\n", opid, rc);
+        FX_DBG("vault_validate_v1: header not ready rc=%d state=%u err=%u\n",
+               rc, vault_state(), vault_err());
+        vault_fail_v1();
         return rc;
     }
-    VDBG("HDR: magic=0x%08x opid=%u len=%u rsvd=0x%08x\n",
-     hdr.magic, hdr.opid, hdr.len, hdr.reserved);
 
+    VDBG("HDR: magic=0x%08x opid=%u len=%u rsvd=0x%08x\n",
+         hdr.magic, hdr.opid, hdr.len, hdr.reserved);
 
     if (hdr.magic != VAULT_MAGIC || hdr.opid != opid || hdr.len != want_len) {
-        FX_DBG("vault_validate_v1: bad header opid=%u got(magic=0x%x opid=%u len=%u) expected(magic=0x%x opid=%u len=%u)\n",
-               opid, hdr.magic, hdr.opid, hdr.len, VAULT_MAGIC, opid, want_len);
-        return -EIO;
+        FX_DBG("vault_validate_v1: header mismatch (magic/opid/len)\n");
+        vault_fail_v1();
+        return -EINVAL;
     }
 
-    /* 2) payload */
-    payload = kmalloc(want_len, GFP_ATOMIC);
-    if (!payload) {
-        FX_DBG("vault_validate_v1: kmalloc payload failed opid=%u len=%u\n", opid, want_len);
+    /* strict length consistency: dlen must match header's len */
+    if (dlen != (VAULT_HDR_SIZE + hdr.len)) {
+        FX_DBG("vault_validate_v1: dlen mismatch dlen=%u expected=%u\n",
+               dlen, (u32)(VAULT_HDR_SIZE + hdr.len));
+        vault_fail_v1();
+        return -EINVAL;
+    }
+
+    blob = kmalloc(dlen, GFP_KERNEL);
+    if (!blob) {
+        vault_fail_v1();
         return -ENOMEM;
     }
 
-    rc = vault_read_bytes_nrst(payload, want_len);
+    rc = vault_read_from_gpa(blob, dlen);
     if (rc != 0) {
-        FX_DBG("vault_validate_v1: read payload failed opid=%u rc=%d\n", opid, rc);
-        kfree(payload);
+        FX_DBG("vault_validate_v1: read blob failed rc=%d\n", rc);
+        kfree(blob);
+        vault_fail_v1();
         return rc;
     }
 
-    /* deterministic pattern: payload[i] == (i & 0xff) */
-    for (u32 i = 0; i < want_len; i++) {
-        u8 exp = (u8)(i & 0xFF);
-        if (payload[i] != exp) {
-            VDBG("vault_validate_v1: payload mismatch opid=%u at i=%u got=0x%02x expected=0x%02x\n",
-                   opid, i, payload[i], exp);
-            kfree(payload);
-            return -EIO;
+
+    /* payload starts after header */
+    for (u32 i = 0; i < hdr.len; i++) {
+        u8 b = blob[VAULT_HDR_SIZE + i];
+        if (b != (u8)(i & 0xFF)) {
+            FX_DBG("vault_validate_v1: pattern mismatch at i=%u got=0x%02x exp=0x%02x\n",
+                   i, b, (u8)(i & 0xFF));
+            kfree(blob);
+            vault_fail_v1();
+            return -EINVAL;
         }
     }
 
-    kfree(payload);
-    VDBG("VALIDATE OK opid=%u\n", opid);
+    kfree(blob);
+
+    /* Step 5 enforcement: tell QEMU we consumed full blob */
+    iowrite32(dlen, mmio + VAULT_DATA_REGISTER);
+
+    /* Close ASAP: detach region immediately after validation */
+    vault_done_v1();
+
     return 0;
 }
+
+
 
 
 
