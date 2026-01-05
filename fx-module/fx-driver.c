@@ -89,8 +89,8 @@ MODULE_LICENSE("GPL");
 
 /* Step 5 (virtio-mem): fixed GPA must match QEMU memaddr */
 #define VAULT_MEMADDR_GPA            0x100000000ULL
-#define VAULT_VMEM_BLOCK_SIZE        (2 * 1024 * 1024UL)
-#define VAULT_MAP_MAX                (2 * 1024 * 1024UL) /* map 2MB at a time (enough for our blob) */
+#define VAULT_VMEM_BLOCK_SIZE        (64 * 1024 * 1024UL)
+#define VAULT_MAP_MAX                (128 * 1024 * 1024UL) /* map 2MB at a time (enough for our blob) */
 
 /***********************************************/
 
@@ -224,7 +224,6 @@ static int vault_validate_v1(u32 opid, u32 want_len);
 static void monitoring_work_fn(struct work_struct *work);
 static void vault_reset_v1(void);
 
-
 static inline u32 vault_status_raw(void)
 {
     return ioread32(mmio + VAULT_STATUS_REGISTER);
@@ -298,7 +297,6 @@ static void monitoring_work_fn(struct work_struct *work)
     vrc = vault_validate_v1(opid, want_len);
     if (vrc == 0) {
         FX_DBG("vault step2: validation OK (opid=%u)\n", opid);
-
         list_processes();
         FX_DBG("monitoring_work: list_processes() completed\n"); 
     }else {
@@ -849,6 +847,11 @@ static int vault_read_from_gpa(void *dst, u32 n)
     if (n > VAULT_MAP_MAX)
         return -EINVAL;
 
+    phys_addr_t pa = VAULT_MEMADDR_GPA;
+    unsigned long pfn = PHYS_PFN(pa);
+
+    if (!pfn_valid(pfn))
+        return -ENXIO;   // not valid/present RAM
     p = memremap(VAULT_MEMADDR_GPA, n, MEMREMAP_WB);
     if (!p)
         return -ENOMEM;
