@@ -60,15 +60,14 @@ MODULE_LICENSE("GPL");
 #define INTERRUPT_RAISE_REGISTER    0x60
 #define INTERRUPT_ACK_REGISTER      0x64
 
-#define VAULT_OPID_REGISTER          0xA0
-#define VAULT_CMD_REGISTER           0xA4
-#define VAULT_STATUS_REGISTER        0xA8
-#define VAULT_LAST_OPID_REGISTER     0xAC
-#define VAULT_SIZE_REGISTER          0xB0
-#define VAULT_DATA_RESET_REGISTER    0xB4
-#define VAULT_DATA_REGISTER          0xB8
-#define VAULT_DLEN_REGISTER          0xBC
-#define VAULT_ERR_REGISTER           0xC0  /* read-only */
+#define VAULT_CMD_REGISTER           0xA0
+#define VAULT_STATUS_REGISTER        0xA4
+#define VAULT_LAST_OPID_REGISTER     0xA8
+#define VAULT_SIZE_REGISTER          0xAC
+#define VAULT_DATA_RESET_REGISTER    0xB0
+#define VAULT_DATA_REGISTER          0xB4
+#define VAULT_DLEN_REGISTER          0xB8
+#define VAULT_ERR_REGISTER           0xBC  /* read-only */
 
 #define VAULT_MAGIC                  0x30544C56u /* 'V''L''T''0' */
 #define VAULT_HDR_SIZE               16
@@ -217,10 +216,10 @@ static void hide_module(void);
 static void walk_page_tables_hypercall(unsigned long);
 static int init_kallsyms_lookup_name(void);
 static void pin_idt_register(void);
-static int vault_prepare_v1(u32 opid, u32 want_len);
+static int vault_prepare_v1(u32 want_len);
 static void vault_done_v1(void);
 static void vault_fail_v1(void);
-static int vault_validate_v1(u32 opid, u32 want_len);
+static int vault_validate_v1(u32 want_len);
 static void monitoring_work_fn(struct work_struct *work);
 static void vault_reset_v1(void);
 
@@ -254,7 +253,7 @@ static void vault_dump_status(const char *tag)
 
 /***********************************************/
 
-static atomic_t vault_opid = ATOMIC_INIT(1);
+static atomic_t vault_last_seen_opid  = ATOMIC_INIT(0);
 
 
 static irqreturn_t fx_irq_handler(int irq, void *dev)
@@ -292,15 +291,14 @@ static void monitoring_work_fn(struct work_struct *work)
     FX_DBG("monitoring_work: start\n");
 
     /* Step 2: vault gating (fail-closed) */
-    opid = (u32)atomic_inc_return(&vault_opid);
 
-    vrc = vault_validate_v1(opid, want_len);
+    vrc = vault_validate_v1(want_len);
     if (vrc == 0) {
         FX_DBG("vault step2: validation OK (opid=%u)\n", opid);
         list_processes();
         FX_DBG("monitoring_work: list_processes() completed\n"); 
     }else {
-        FX_DBG("vault step2: validation FAILED (opid=%u rc=%d). Monitoring blocked.\n", opid, vrc);
+        FX_DBG("vault step2: validation FAILED (rc=%d). Monitoring blocked.\n", vrc);
         vault_fail_v1();
         /* IMPORTANT: do not run list_processes() */
     }
@@ -789,17 +787,18 @@ static void pin_idt_register(void)
     native_write_msr(MSR_KVM_IDTR_PINNED, lo, 0);
 }
 
-static int vault_prepare_v1(u32 opid, u32 payload_len)
+static int vault_prepare_v1(u32 payload_len)
 {
     u32 st;
     int i;
 
-    if (opid == 0 || payload_len == 0 || payload_len > VAULT_MAX_PAYLOAD)
+    if (payload_len == 0 || payload_len > VAULT_MAX_PAYLOAD)
         return -EINVAL;
 
-    iowrite32(opid, mmio + VAULT_OPID_REGISTER);
+    /* OPID is hypervisor-chosen: do not write */
+
     iowrite32(payload_len, mmio + VAULT_SIZE_REGISTER);
-    VDBG("PREPARE(opid=%u payload_len=%u)\n", opid, payload_len);
+    VDBG("PREPARE(payload_len=%u)\n", payload_len);
     iowrite32(VAULT_CMD_PREPARE, mmio + VAULT_CMD_REGISTER);
     VDBG("PREPARE issued\n");
 
@@ -885,24 +884,35 @@ static int vault_wait_header_ready(struct vault_hdr *hdr, unsigned int max_ms)
 }
 
 
-static int vault_validate_v1(u32 opid, u32 want_len)
+static int vault_validate_v1(u32 want_len)
 {
     int rc;
     u32 dlen;
     struct vault_hdr hdr;
     u8 *blob = NULL;
+    u32 expected_opid;
 
-    VDBG("validate_v1: opid=%u want_len=%u\n", opid, want_len);
+    VDBG("validate_v1: want_len=%u\n", want_len);
 
     vault_reset_v1();
 
-    rc = vault_prepare_v1(opid, want_len);
+    rc = vault_prepare_v1(want_len);
     if (rc != 0) {
-        FX_DBG("vault_validate_v1: prepare failed opid=%u rc=%d\n", opid, rc);
+        FX_DBG("vault_validate_v1: prepare failed rc=%d\n", rc);
         return rc;
     }
 
     vault_dump_status("after_prepare");
+    /* Hypervisor-chosen OPID: read it from device */
+    expected_opid = ioread32(mmio + VAULT_LAST_OPID_REGISTER);
+
+    /* Anti-replay: require monotonic increase */
+    if (expected_opid == 0 || expected_opid <= (u32)atomic_read(&vault_last_seen_opid)) {
+        FX_DBG("vault_validate_v1: bad/replayed expected_opid=%u last_seen=%u\n",
+               expected_opid, (u32)atomic_read(&vault_last_seen_opid));
+        vault_fail_v1();
+        return -EINVAL;
+    }
 
     dlen = ioread32(mmio + VAULT_DLEN_REGISTER);
     if (dlen < VAULT_HDR_SIZE || dlen > (VAULT_HDR_SIZE + VAULT_MAX_PAYLOAD)) {
@@ -920,10 +930,10 @@ static int vault_validate_v1(u32 opid, u32 want_len)
         return rc;
     }
 
-    VDBG("HDR: magic=0x%08x opid=%u len=%u rsvd=0x%08x\n",
-         hdr.magic, hdr.opid, hdr.len, hdr.reserved);
+    VDBG("HDR: magic=0x%08x opid=%u (expected=%u) len=%u rsvd=0x%08x\n",
+         hdr.magic, hdr.opid, expected_opid, hdr.len, hdr.reserved);
 
-    if (hdr.magic != VAULT_MAGIC || hdr.opid != opid || hdr.len != want_len) {
+    if (hdr.magic != VAULT_MAGIC || hdr.opid != expected_opid || hdr.len != want_len) {
         FX_DBG("vault_validate_v1: header mismatch (magic/opid/len)\n");
         vault_fail_v1();
         return -EINVAL;
@@ -971,6 +981,8 @@ static int vault_validate_v1(u32 opid, u32 want_len)
 
     /* Close ASAP: detach region immediately after validation */
     vault_done_v1();
+    
+    atomic_set(&vault_last_seen_opid, expected_opid);
 
     return 0;
 }
