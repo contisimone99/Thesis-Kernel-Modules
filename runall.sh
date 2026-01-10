@@ -27,6 +27,7 @@ sudo ~/qemu/build/qemu-system-x86_64 \
     -boot c \
     -m 512M,maxmem=1G \
     -cpu host \
+    -smp 4 \
     -drive file=./debian-rootfs/example.img,format=raw,media=disk,if=ide \
     -k it \
     -s \
@@ -38,3 +39,4 @@ sudo ~/qemu/build/qemu-system-x86_64 \
     2>/tmp/qemu-kvm.log
 
 
+#
