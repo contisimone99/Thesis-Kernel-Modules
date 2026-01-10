@@ -11,7 +11,8 @@ sudo mkdir -p "$MNT"
 sudo mount -o loop -t ext4 "$IMG" "$MNT"
 
 # Copia i .ko dentro /root dell'FS
-sudo find ./fx-module -name '*.ko' -exec cp "{}" "$MNT/root" \;
+#sudo find ./fx-module -name '*.ko' -exec cp "{}" "$MNT/root" \;
+sudo find ./fxV2-module -name '*.ko' -exec cp "{}" "$MNT/root" \;
 
 sudo umount "$MNT"
 
