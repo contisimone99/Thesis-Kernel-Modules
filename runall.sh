@@ -35,7 +35,7 @@ sudo ~/qemu/build/qemu-system-x86_64 \
     -device e1000,netdev=network0,mac=52:54:00:12:34:56 \
     -object memory-backend-ram,id=vaultmem,size=256M \
     -device virtio-mem-pci,id=vault0,memdev=vaultmem,memaddr=0x100000000,requested-size=0,block-size=128M \
-    -append "console=ttyS0 root=/dev/sda rw nokaslr memhp_default_state=online_movable" \
+    -append "console=ttyS0 root=/dev/sda rw nokaslr memhp_default_state=offline" \
     2>/tmp/qemu-kvm.log
 
 
