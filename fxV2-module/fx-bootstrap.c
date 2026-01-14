@@ -8,6 +8,14 @@
 #include <linux/sched.h>
 #include <linux/sched/signal.h>    // struct task_struct, TASK_COMM_LEN
 #include <linux/errno.h>
+#include <linux/fdtable.h>
+#include <linux/fs.h>
+#include <linux/mm.h>
+#include <linux/preempt.h>
+
+#include <asm/special_insns.h>   /* __read_cr3/read_cr3, native_read_cr4 */
+#include <asm/processor.h>       /* read_cr3(), in alcuni kernel */
+#include <asm/page_types.h>      /* PAGE_OFFSET / __PAGE_OFFSET_BASE */
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Simone Conti");
@@ -31,10 +39,31 @@ MODULE_DESCRIPTION("FX bootstrap one-shot: sends kernel layout info to VMM then 
  ************************************************/
 struct fx_bootstrap_info {
     u64 init_task_addr;      // address of init_task symbol
+
+    /* task_struct layout */
     u32 off_tasks;           // offsetof(task_struct, tasks)
     u32 off_pid;             // offsetof(task_struct, pid)
     u32 off_comm;            // offsetof(task_struct, comm)
     u32 comm_len;            // TASK_COMM_LEN
+
+    /* file-descriptor related layout (for future steps) */
+    u32 off_files;           // offsetof(task_struct, files)
+    u32 off_files_fdt;       // offsetof(files_struct, fdt)
+    u32 off_fdt_max_fds;     // offsetof(fdtable, max_fds)
+    u32 off_fdt_fd;          // offsetof(fdtable, fd)
+    u32 off_file_inode;      // offsetof(file, f_inode)
+    u32 off_inode_mode;      // offsetof(inode, i_mode)
+
+    /* paging context hints (for VA->PA translation / mapping) */
+    u64 kernel_cr3_pa;       // native_read_cr3() masked to 4K base
+    u64 kernel_cr4;          // native_read_cr4()
+    u32 la57;                // CR4.LA57 (0/1)
+    u32 pcid;                // CR4.PCIDE (0/1)
+
+    /* best-effort sanity checks / constants */
+    u64 init_task_pa;        // __pa(init_task_addr) best-effort
+    u64 page_offset;         // __PAGE_OFFSET_BASE (direct map base)
+
     u32 task_struct_size;    // sizeof(struct task_struct)
     u32 abi;                 // versioning
     u32 reserved;
@@ -119,6 +148,34 @@ static void generic_hypercall(unsigned int type, void *addr, unsigned int size, 
         : "r8", "r9", "r10", "r11", "r12", "memory");
 }
 
+
+static inline u64 fx_read_cr3_raw(void)
+{
+    /*
+     * Kernel-API differences:
+     * - some expose read_cr3()
+     * - others expose __read_cr3()
+     */
+#if defined(read_cr3)
+    return (u64)read_cr3();
+#else
+    return (u64)__read_cr3();
+#endif
+}
+
+static inline u64 fx_page_offset_base(void)
+{
+#ifdef __PAGE_OFFSET_BASE
+    return (u64)__PAGE_OFFSET_BASE;
+#elif defined(PAGE_OFFSET)
+    return (u64)PAGE_OFFSET;
+#else
+    return 0; /* best-effort fallback, should not happen on x86_64 */
+#endif
+}
+
+
+
 /************************************************
  * One-shot init: collect -> send -> cleanup -> self-unload
  ************************************************/
@@ -153,6 +210,38 @@ static int __init fx_bootstrap_init(void)
     info.off_pid          = (u32)offsetof(struct task_struct, pid);
     info.off_comm         = (u32)offsetof(struct task_struct, comm);
     info.comm_len         = (u32)TASK_COMM_LEN;
+    info.off_files        = (u32)offsetof(struct task_struct, files);
+    info.off_files_fdt    = (u32)offsetof(struct files_struct, fdt);
+    info.off_fdt_max_fds  = (u32)offsetof(struct fdtable, max_fds);
+    info.off_fdt_fd       = (u32)offsetof(struct fdtable, fd);
+    info.off_file_inode   = (u32)offsetof(struct file, f_inode);
+    info.off_inode_mode   = (u32)offsetof(struct inode, i_mode);
+
+        /* paging context (best effort) */
+    preempt_disable();
+    {
+        u64 cr3 = fx_read_cr3_raw();
+        u64 cr4 = native_read_cr4();
+
+        info.kernel_cr3_pa = cr3 & ~0xfffULL;
+        info.kernel_cr4    = cr4;
+
+    #ifdef X86_CR4_LA57
+        info.la57 = !!(cr4 & X86_CR4_LA57);
+    #else
+        info.la57 = 0;
+    #endif
+
+    #ifdef X86_CR4_PCIDE
+        info.pcid = !!(cr4 & X86_CR4_PCIDE);
+    #else
+        info.pcid = 0;
+    #endif
+    }
+    preempt_enable();
+
+    info.init_task_pa  = (u64)__pa((void *)info.init_task_addr);
+    info.page_offset = fx_page_offset_base();
     info.task_struct_size = (u32)sizeof(struct task_struct);
     info.abi              = 1;
 
@@ -162,23 +251,6 @@ static int __init fx_bootstrap_init(void)
         pr_err("fx-bootstrap: FX device %04x:%04x not found\n", VENDOR_ID, DEVICE_ID);
         return -ENODEV;
     }
-
-    /*if(pci_enable_device(pdev) < 0){
-        dev_err(&(pdev->dev), "error in pci_enable_device\n");
-        return -1;
-    }
-
-    if(pci_request_region(pdev, BAR, "myregion0")){
-		dev_err(&(pdev->dev), "error in pci_request_region\n");
-		return -1;
-	}
-
-    mmio = pci_iomap(pdev, BAR, pci_resource_len(pdev, BAR));
-    if (!mmio) {
-        dev_err(&(pdev->dev), "error in pci_iomap\n");
-        pci_release_region(pdev, BAR);
-        return -1;
-    }*/
     
     ret = pci_enable_device(pdev);
     if (ret) {
@@ -207,8 +279,8 @@ static int __init fx_bootstrap_init(void)
     mmio = bar;
 
     /* 5) Send to VMM */
-    pr_info("fx-bootstrap: sending init_task=%px off_tasks=0x%x off_pid=0x%x off_comm=0x%x\n",
-            (void *)info.init_task_addr, info.off_tasks, info.off_pid, info.off_comm);
+    pr_info("fx-bootstrap: sending init_task=%px off_tasks=0x%x off_pid=0x%x off_comm=0x%x cr3_pa=0x%llx la57=%u page_offset=0x%llx\n",
+            (void *)info.init_task_addr, info.off_tasks, info.off_pid, info.off_comm, (unsigned long long)info.kernel_cr3_pa, info.la57, (unsigned long long)info.page_offset);
 
     generic_hypercall(BOOTSTRAP_INFO_HYPERCALL, &info, sizeof(info), 0);
 
