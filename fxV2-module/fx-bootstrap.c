@@ -46,14 +46,6 @@ struct fx_bootstrap_info {
     u32 off_comm;            // offsetof(task_struct, comm)
     u32 comm_len;            // TASK_COMM_LEN
 
-    /* file-descriptor related layout (for future steps) */
-    u32 off_files;           // offsetof(task_struct, files)
-    u32 off_files_fdt;       // offsetof(files_struct, fdt)
-    u32 off_fdt_max_fds;     // offsetof(fdtable, max_fds)
-    u32 off_fdt_fd;          // offsetof(fdtable, fd)
-    u32 off_file_inode;      // offsetof(file, f_inode)
-    u32 off_inode_mode;      // offsetof(inode, i_mode)
-
     /* paging context hints (for VA->PA translation / mapping) */
     u64 kernel_cr3_pa;       // native_read_cr3() masked to 4K base
     u64 kernel_cr4;          // native_read_cr4()
@@ -65,8 +57,6 @@ struct fx_bootstrap_info {
     u64 page_offset;         // __PAGE_OFFSET_BASE (direct map base)
 
     u32 task_struct_size;    // sizeof(struct task_struct)
-    u32 abi;                 // versioning
-    u32 reserved;
 } __packed;
 
 /************************************************
@@ -210,12 +200,6 @@ static int __init fx_bootstrap_init(void)
     info.off_pid          = (u32)offsetof(struct task_struct, pid);
     info.off_comm         = (u32)offsetof(struct task_struct, comm);
     info.comm_len         = (u32)TASK_COMM_LEN;
-    info.off_files        = (u32)offsetof(struct task_struct, files);
-    info.off_files_fdt    = (u32)offsetof(struct files_struct, fdt);
-    info.off_fdt_max_fds  = (u32)offsetof(struct fdtable, max_fds);
-    info.off_fdt_fd       = (u32)offsetof(struct fdtable, fd);
-    info.off_file_inode   = (u32)offsetof(struct file, f_inode);
-    info.off_inode_mode   = (u32)offsetof(struct inode, i_mode);
 
         /* paging context (best effort) */
     preempt_disable();
@@ -243,7 +227,6 @@ static int __init fx_bootstrap_init(void)
     info.init_task_pa  = (u64)__pa((void *)info.init_task_addr);
     info.page_offset = fx_page_offset_base();
     info.task_struct_size = (u32)sizeof(struct task_struct);
-    info.abi              = 1;
 
     /* 4) Locate FX device and map BAR */
     pdev = pci_get_device(VENDOR_ID, DEVICE_ID, NULL);
