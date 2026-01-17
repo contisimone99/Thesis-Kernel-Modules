@@ -274,10 +274,23 @@ static int __init fx_bootstrap_init(void)
     pci_dev_put(pdev);
 
     /*
-     * 7) Self-unload: return an error from init
+     * 7) Self-unload: call the function that removes this module
+     from the kernel patch of module_schedule_self_remove() in the kernel guest 6.6.
      * Kernel will free module automatically -> no residual module loaded.
      */
-    return -EAGAIN;
+     module_schedule_self_remove(THIS_MODULE);
+	
+	pr_info("fx-bootstrap: initialization complete, module will self-remove\n");
+	
+	
+	return 0;
 }
 
+static void __exit fx_bootstrap_exit(void)
+{
+	pr_info("fx-bootstrap: module removed cleanly\n");
+}
+
+
 module_init(fx_bootstrap_init);
+module_exit(fx_bootstrap_exit);
