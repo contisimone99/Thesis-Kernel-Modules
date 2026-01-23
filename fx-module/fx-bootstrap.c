@@ -119,8 +119,6 @@ static void __iomem *mmio;
  ************************************************/
 static void generic_hypercall(unsigned int type, void *addr, unsigned int size, unsigned int flag)
 {
-    pr_info("[FX] generic_hypercall: type=%u addr=%px size=0x%x flag=0x%x\n",
-            type, addr, size, flag);
     __asm__ volatile(
         "mfence\n\t"
         "mov %0, %%r8\n\t"
@@ -183,14 +181,14 @@ static int __init fx_bootstrap_init(void)
     /* 1) Resolve kallsyms_lookup_name */
     ret = init_kallsyms_lookup_name();
     if (ret) {
-        pr_err("fx-bootstrap: failed to init kallsyms_lookup_name (%d)\n", ret);
+        //pr_err("fx-bootstrap: failed to init kallsyms_lookup_name (%d)\n", ret);
         return ret;
     }
 
     /* 2) Resolve init_task symbol address */
     init_task_sym = kallsyms_lookup_name_ptr("init_task");
     if (!init_task_sym) {
-        pr_err("fx-bootstrap: kallsyms_lookup_name(\"init_task\") failed\n");
+        //pr_err("fx-bootstrap: kallsyms_lookup_name(\"init_task\") failed\n");
         return -ENOENT;
     }
 
@@ -231,20 +229,20 @@ static int __init fx_bootstrap_init(void)
     /* 4) Locate FX device and map BAR */
     pdev = pci_get_device(VENDOR_ID, DEVICE_ID, NULL);
     if (!pdev) {
-        pr_err("fx-bootstrap: FX device %04x:%04x not found\n", VENDOR_ID, DEVICE_ID);
+        //pr_err("fx-bootstrap: FX device %04x:%04x not found\n", VENDOR_ID, DEVICE_ID);
         return -ENODEV;
     }
     
     ret = pci_enable_device(pdev);
     if (ret) {
-        pr_err("fx-bootstrap: pci_enable_device failed (%d)\n", ret);
+        //pr_err("fx-bootstrap: pci_enable_device failed (%d)\n", ret);
         pci_dev_put(pdev);
         return ret;
     }
 
     ret = pci_request_region(pdev, BAR, "fx-bootstrap");
     if (ret) {
-        pr_err("fx-bootstrap: pci_request_region failed (%d)\n", ret);
+        //pr_err("fx-bootstrap: pci_request_region failed (%d)\n", ret);
         pci_disable_device(pdev);
         pci_dev_put(pdev);
         return ret;
@@ -252,7 +250,7 @@ static int __init fx_bootstrap_init(void)
 
     bar = pci_iomap(pdev, BAR, pci_resource_len(pdev, BAR));
     if (!bar) {
-        pr_err("fx-bootstrap: pci_iomap failed\n");
+        //pr_err("fx-bootstrap: pci_iomap failed\n");
         pci_release_region(pdev, BAR);
         pci_disable_device(pdev);
         pci_dev_put(pdev);
@@ -262,8 +260,6 @@ static int __init fx_bootstrap_init(void)
     mmio = bar;
 
     /* 5) Send to VMM */
-    pr_info("fx-bootstrap: sending init_task=%px off_tasks=0x%x off_pid=0x%x off_comm=0x%x cr3_pa=0x%llx la57=%u page_offset=0x%llx\n",
-            (void *)info.init_task_addr, info.off_tasks, info.off_pid, info.off_comm, (unsigned long long)info.kernel_cr3_pa, info.la57, (unsigned long long)info.page_offset);
 
     generic_hypercall(BOOTSTRAP_INFO_HYPERCALL, &info, sizeof(info), 0);
 
@@ -272,15 +268,6 @@ static int __init fx_bootstrap_init(void)
     pci_release_region(pdev, BAR);
     pci_disable_device(pdev);
     pci_dev_put(pdev);
-
-    /*
-     * 7) Self-unload: call the function that removes this module
-     from the kernel patch of module_schedule_self_remove() in the kernel guest 6.6.
-     * Kernel will free module automatically -> no residual module loaded.
-     */
-     module_schedule_self_remove(THIS_MODULE);
-	
-	pr_info("fx-bootstrap: initialization complete, module will self-remove\n");
 	
 	
 	return 0;
@@ -288,7 +275,6 @@ static int __init fx_bootstrap_init(void)
 
 static void __exit fx_bootstrap_exit(void)
 {
-	pr_info("fx-bootstrap: module removed cleanly\n");
 }
 
 
