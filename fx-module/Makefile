@@ -1,6 +1,6 @@
 EXTRA_CFLAGS  := -g
 
-obj-m:=fx-driver.o
+obj-m:=fx-bootstrap.o
 all:
 	make -C ~/Thesis-Kernel-Modules/linux M=$(shell pwd) modules
 clean:

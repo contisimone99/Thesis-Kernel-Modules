@@ -4,18 +4,49 @@ set -e
 MNT=/mnt/example
 IMG=./debian-rootfs/example.img
 
-# Crea il mount point se non esiste
+# Create mount point
 sudo mkdir -p "$MNT"
 
-# Monta l'immagine
+# Mount image
 sudo mount -o loop -t ext4 "$IMG" "$MNT"
 
-# Copia i .ko dentro /root dell'FS
+# Copy .ko files into /root of the FS
 sudo find ./fx-module -name '*.ko' -exec cp "{}" "$MNT/root" \;
+
+# copy one shot boot script
+sudo cp ./fx-boot.sh "$MNT/root/fx-boot.sh"
+sudo chmod 0700 "$MNT/root/fx-boot.sh"
+sudo chown root:root "$MNT/root/fx-boot.sh"
+
+# 3) Scrivi la unit systemd nel guest
+sudo mkdir -p "$MNT/etc/systemd/system"
+sudo tee "$MNT/etc/systemd/system/fx-boot.service" >/dev/null <<'EOF'
+[Unit]
+Description=FX one-shot bootstrap (load module, cleanup, self-remove)
+DefaultDependencies=yes
+Wants=network-online.target
+After=network-online.target ssh.service
+
+[Service]
+Type=oneshot
+ExecStart=/root/fx-boot.sh
+RemainAfterExit=no
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo chmod 0644 "$MNT/etc/systemd/system/fx-boot.service"
+sudo chown root:root "$MNT/etc/systemd/system/fx-boot.service"
+
+# 4) Enable offline: symlink in multi-user.target.wants
+sudo mkdir -p "$MNT/etc/systemd/system/multi-user.target.wants"
+sudo ln -sf ../fx-boot.service \
+  "$MNT/etc/systemd/system/multi-user.target.wants/fx-boot.service"
 
 sudo umount "$MNT"
 
-# Avvia QEMU
+# Start QEMU
 
 sudo ~/qemu/build/qemu-system-x86_64 \
     -nographic \
@@ -26,14 +57,18 @@ sudo ~/qemu/build/qemu-system-x86_64 \
     -boot c \
     -m 512M,maxmem=1G \
     -cpu host \
+    -smp 4 \
     -drive file=./debian-rootfs/example.img,format=raw,media=disk,if=ide \
     -k it \
     -s \
     -netdev user,id=network0,hostfwd=tcp::10022-:22 \
     -device e1000,netdev=network0,mac=52:54:00:12:34:56 \
-    -object memory-backend-ram,id=vaultmem,size=256M \
-    -device virtio-mem-pci,id=vault0,memdev=vaultmem,memaddr=0x100000000,requested-size=0,block-size=128M \
-    -append "console=ttyS0 root=/dev/sda rw nokaslr memhp_default_state=online_movable" \
+    -object memory-backend-ram,id=vaultmem_code,size=128M \
+    -device virtio-mem-pci,id=vault0,memdev=vaultmem_code,memaddr=0x100000000,requested-size=0,block-size=128M \
+    -object memory-backend-ram,id=vaultmem_stack,size=128M \
+    -device virtio-mem-pci,id=vault1,memdev=vaultmem_stack,memaddr=0x108000000,requested-size=0,block-size=128M \
+    -append "console=ttyS0 root=/dev/sda rw memhp_default_state=offline" \
     2>/tmp/qemu-kvm.log
 
 
+#
