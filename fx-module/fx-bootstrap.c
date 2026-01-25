@@ -54,7 +54,19 @@ struct fx_bootstrap_info {
 
     /* best-effort sanity checks / constants */
     u64 init_task_pa;        // __pa(init_task_addr) best-effort
-    u64 page_offset;         // __PAGE_OFFSET_BASE (direct map base)
+    u64 physmap_base_va;     // __PAGE_OFFSET_BASE (direct map base)
+
+    /* guest memory size hint (for mapping physmap fully) */
+    u64 physmap_size;        // max_pfn << PAGE_SHIFT (best effort)
+
+    /* kernel image mapping (VA->PA without guest page tables) */
+    u64 kernel_text_va;      // _stext VA
+    u64 kernel_text_pa;     // _stext PA (phys_base + offset)
+    u64 kernel_end_va;       // _end VA
+
+    /* vmalloc area (range only; not linearly translatable) */
+    u64 vmalloc_start;
+    u64 vmalloc_end;
 
     u32 task_struct_size;    // sizeof(struct task_struct)
 } __packed;
@@ -175,7 +187,8 @@ static int __init fx_bootstrap_init(void)
 
     struct fx_bootstrap_info info;
     unsigned long init_task_sym;
-
+    unsigned long sym;
+    u64 tmp;
     memset(&info, 0, sizeof(info));
 
     /* 1) Resolve kallsyms_lookup_name */
@@ -223,9 +236,53 @@ static int __init fx_bootstrap_init(void)
     preempt_enable();
 
     info.init_task_pa  = (u64)__pa((void *)info.init_task_addr);
-    info.page_offset = fx_page_offset_base();
+    info.physmap_base_va = fx_page_offset_base();
     info.task_struct_size = (u32)sizeof(struct task_struct);
+    /*
+     * Extra layout info for hyper-owned page tables (bootstrap is trusted):
+     *  - physmap_size: used to map direct-map fully without using guest CR3
+     *  - kernel image mapping: _stext/_end + phys_base
+     *  - vmalloc range: guardrail / future work
+     */
 
+    /* physmap_size from max_pfn (best effort via kallsyms) */
+    sym = kallsyms_lookup_name_ptr("max_pfn");
+    if (sym) {
+        /* max_pfn is usually unsigned long */
+        tmp = *(unsigned long *)sym;
+        info.physmap_size = tmp << PAGE_SHIFT;
+    } else {
+        info.physmap_size = 0;
+    }
+
+    /* kernel image VA range: _stext .. _end */
+    sym = kallsyms_lookup_name_ptr("_stext");
+    info.kernel_text_va = sym ? (u64)sym : 0;
+    sym = kallsyms_lookup_name_ptr("_end");
+    info.kernel_end_va  = sym ? (u64)sym : 0;
+
+
+    /*
+     * Robust kernel image PA anchor:
+     * Use __pa_symbol(_stext) instead of phys_base.
+     */
+    if (info.kernel_text_va) {
+        info.kernel_text_pa = (u64)__pa_symbol((void *)info.kernel_text_va);
+    } else {
+        info.kernel_text_pa = 0;
+    }
+
+    /* vmalloc range macros (x86_64) */
+#ifdef VMALLOC_START
+    info.vmalloc_start = (u64)VMALLOC_START;
+#else
+    info.vmalloc_start = 0;
+#endif
+#ifdef VMALLOC_END
+    info.vmalloc_end   = (u64)VMALLOC_END;
+#else
+    info.vmalloc_end   = 0;
+#endif
     /* 4) Locate FX device and map BAR */
     pdev = pci_get_device(VENDOR_ID, DEVICE_ID, NULL);
     if (!pdev) {
@@ -261,6 +318,12 @@ static int __init fx_bootstrap_init(void)
 
     /* 5) Send to VMM */
 
+    //print the struct we send
+    pr_info("Information sent to VMM: init_task_addr=0x%llx off_tasks=0x%x off_pid=0x%x off_comm=0x%x comm_len=0x%x kernel_cr3_pa=0x%llx kernel_cr4=0x%llx la57=0x%x pcid=0x%x init_task_pa=0x%llx physmap_base_va=0x%llx physmap_size=0x%llx kernel_text_va=0x%llx kernel_end_va=0x%llx kernel_text_pa=0x%llx\n",
+             info.init_task_addr, info.off_tasks, info.off_pid, info.off_comm, info.comm_len,
+             info.kernel_cr3_pa, info.kernel_cr4, info.la57, info.pcid, info.init_task_pa,
+             info.physmap_base_va, info.physmap_size, info.kernel_text_va, info.kernel_end_va,
+             info.kernel_text_pa);
     generic_hypercall(BOOTSTRAP_INFO_HYPERCALL, &info, sizeof(info), 0);
 
     /* 6) Cleanup (leave no handlers/threads) */
